@@ -1,6 +1,24 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { ProviderLogo } from "./provider-logo";
+import { hasProviderLogo, ProviderLogo } from "./provider-logo";
+
+describe("hasProviderLogo", () => {
+  it("reports only the providers that render a mark of their own", () => {
+    expect(hasProviderLogo("claude")).toBe(true);
+    expect(hasProviderLogo("qwen")).toBe(true);
+    // ProviderLogo answers these with the generic Monitor placeholder, which
+    // identifies nothing — callers choosing an identity glyph must not use it.
+    expect(hasProviderLogo("some-custom-backend")).toBe(false);
+    expect(hasProviderLogo("")).toBe(false);
+    expect(hasProviderLogo(null)).toBe(false);
+    expect(hasProviderLogo(undefined)).toBe(false);
+  });
+
+  it("stays false for inherited Object properties", () => {
+    expect(hasProviderLogo("toString")).toBe(false);
+    expect(hasProviderLogo("constructor")).toBe(false);
+  });
+});
 
 describe("ProviderLogo", () => {
   it("renders the dedicated Qwen Code mark", () => {

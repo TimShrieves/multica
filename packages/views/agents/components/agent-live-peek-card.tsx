@@ -17,6 +17,7 @@ import { AlertTriangle } from "lucide-react";
 import { AppLink } from "../../navigation";
 import { useT, useTimeAgo } from "../../i18n";
 import { availabilityConfig, workloadConfig } from "../presence";
+import { AgentRuntimeIcon } from "./agent-runtime-icon";
 
 interface AgentLivePeekCardProps {
   agentId: string;
@@ -91,6 +92,7 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
           initials={initials}
           avatarUrl={resolvePublicFileUrl(agent.avatar_url)}
           isAgent
+          fallback={<AgentRuntimeIcon agentId={agent.id} />}
           size="xl"
         />
         <div className="min-w-0 flex-1">

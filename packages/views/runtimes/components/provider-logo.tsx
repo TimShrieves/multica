@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 import { Monitor } from "lucide-react";
 import qwenLogo from "./qwen-logo.svg";
 
@@ -295,6 +295,44 @@ function QwenLogo({ className }: { className: string }) {
   return <img src={qwenLogoSrc} alt="" aria-hidden className={className} />;
 }
 
+// Single source of truth for "which providers ship a real mark". Kept as a map
+// rather than a switch so `hasProviderLogo` can't drift from what
+// `ProviderLogo` actually renders.
+const PROVIDER_LOGOS: Record<string, (props: { className: string }) => ReactNode> = {
+  claude: ClaudeLogo,
+  codebuddy: CodeBuddyLogo,
+  codex: CodexLogo,
+  opencode: OpenCodeLogo,
+  deveco: DevecoLogo,
+  openclaw: OpenClawLogo,
+  hermes: HermesLogo,
+  pi: PiLogo,
+  copilot: CopilotLogo,
+  cursor: CursorLogo,
+  kimi: KimiLogo,
+  kiro: KiroLogo,
+  qoder: QoderLogo,
+  antigravity: AntigravityLogo,
+  traecli: TraeLogo,
+  grok: GrokLogo,
+  qwen: QwenLogo,
+};
+
+/**
+ * True when `provider` has a brand mark of its own. Callers that only want to
+ * show a logo when it actually identifies something — an agent avatar falling
+ * back to its runtime, say — check this first, because the generic `Monitor`
+ * placeholder `ProviderLogo` returns otherwise carries no identity.
+ */
+export function hasProviderLogo(
+  provider: string | null | undefined,
+): provider is string {
+  // Own-property check, not `in`: `provider` is a server-supplied slug, and a
+  // custom runtime profile named "toString" or "constructor" would otherwise
+  // resolve to an Object.prototype method and get rendered as a component.
+  return !!provider && Object.hasOwn(PROVIDER_LOGOS, provider);
+}
+
 export function ProviderLogo({
   provider,
   className = "h-4 w-4",
@@ -302,42 +340,9 @@ export function ProviderLogo({
   provider: string;
   className?: string;
 }) {
-  switch (provider) {
-    case "claude":
-      return <ClaudeLogo className={className} />;
-    case "codebuddy":
-      return <CodeBuddyLogo className={className} />;
-    case "codex":
-      return <CodexLogo className={className} />;
-    case "opencode":
-      return <OpenCodeLogo className={className} />;
-    case "deveco":
-      return <DevecoLogo className={className} />;
-    case "openclaw":
-      return <OpenClawLogo className={className} />;
-    case "hermes":
-      return <HermesLogo className={className} />;
-    case "pi":
-      return <PiLogo className={className} />;
-    case "copilot":
-      return <CopilotLogo className={className} />;
-    case "cursor":
-      return <CursorLogo className={className} />;
-    case "kimi":
-      return <KimiLogo className={className} />;
-    case "kiro":
-      return <KiroLogo className={className} />;
-    case "qoder":
-      return <QoderLogo className={className} />;
-    case "antigravity":
-      return <AntigravityLogo className={className} />;
-    case "traecli":
-      return <TraeLogo className={className} />;
-    case "grok":
-      return <GrokLogo className={className} />;
-    case "qwen":
-      return <QwenLogo className={className} />;
-    default:
-      return <Monitor className={className} />;
+  if (!hasProviderLogo(provider)) {
+    return <Monitor className={className} />;
   }
+  const Logo = PROVIDER_LOGOS[provider]!;
+  return <Logo className={className} />;
 }

@@ -18,6 +18,7 @@ import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { AppLink } from "../../navigation";
 import { HealthIcon } from "../../runtimes/components/shared";
 import { availabilityConfig } from "../presence";
+import { AgentRuntimeIcon } from "./agent-runtime-icon";
 import { VisibilityBadge } from "./visibility-badge";
 import { useT } from "../../i18n";
 
@@ -80,6 +81,7 @@ export function AgentProfileCard({ agentId }: AgentProfileCardProps) {
           initials={initials}
           avatarUrl={resolvePublicFileUrl(agent.avatar_url)}
           isAgent
+          fallback={<AgentRuntimeIcon agentId={agent.id} />}
           size="xl"
         />
         <div className="min-w-0 flex-1">

@@ -1,32 +1,20 @@
 package handler
 
 import (
-	"crypto/rand"
-	"math/big"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const agentEmojiAvatarPrefix = "emoji:"
-
-var agentEmojiAvatars = []string{
-	"🐙", "🦊", "🦉", "🐝", "🐼", "🐸", "🐯", "🦁",
-	"🐨", "🐵", "🐧", "🐳", "🦋", "🌞", "🌙", "⭐",
-	"🔥", "⚡", "🍀", "🌈", "🚀", "🤖", "👾", "🧠",
-}
-
-func randomAgentEmojiAvatar() string {
-	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(agentEmojiAvatars))))
-	if err != nil {
-		return agentEmojiAvatarPrefix + agentEmojiAvatars[0]
-	}
-	return agentEmojiAvatarPrefix + agentEmojiAvatars[index.Int64()]
-}
-
+// newAgentAvatar normalises a create-time avatar_url. An omitted, empty, or
+// whitespace-only value stores NULL rather than a generated placeholder: an
+// agent without an uploaded avatar renders the icon of the runtime it is bound
+// to, and that has to stay correct when the agent is later rebound to another
+// runtime. Persisting a snapshot of the runtime — or a random glyph, as the
+// former emoji default did — would freeze the wrong identity into the row.
 func newAgentAvatar(avatarURL *string) pgtype.Text {
-	if avatarURL != nil && strings.TrimSpace(*avatarURL) != "" {
-		return pgtype.Text{String: *avatarURL, Valid: true}
+	if avatarURL == nil || strings.TrimSpace(*avatarURL) == "" {
+		return pgtype.Text{}
 	}
-	return pgtype.Text{String: randomAgentEmojiAvatar(), Valid: true}
+	return pgtype.Text{String: *avatarURL, Valid: true}
 }

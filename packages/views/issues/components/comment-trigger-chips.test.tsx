@@ -16,6 +16,14 @@ vi.mock("../../common/actor-avatar", () => ({
   AgentStatusDot: () => <span data-testid="status-dot" />,
 }));
 
+// The avatar's no-avatar fallback resolves the agent's runtime through two
+// workspace queries. This file has no QueryClient and is about the trigger
+// sentence, not which glyph the avatar lands on — same reason AgentStatusDot
+// is stubbed above.
+vi.mock("../../agents/components/agent-runtime-icon", () => ({
+  AgentRuntimeIcon: () => <span data-testid="runtime-icon" />,
+}));
+
 const walt: CommentTriggerPreviewAgent = {
   id: "agent-1",
   name: "Walt",

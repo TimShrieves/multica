@@ -15,6 +15,7 @@ import type {
   WorkspaceWorkingAgentMineRelation,
 } from "@multica/core/types";
 import { AgentAvatarStack } from "../../agents/components/agent-avatar-stack";
+import { AgentRuntimeIcon } from "../../agents/components/agent-runtime-icon";
 import { useT } from "../../i18n";
 
 interface WorkspaceAgentWorkingChipProps {
@@ -72,6 +73,7 @@ export function WorkingAgentsHoverContent({
               initials={agent.name.trim().slice(0, 2).toUpperCase()}
               avatarUrl={agent.avatar_url ?? undefined}
               isAgent
+              fallback={<AgentRuntimeIcon agentId={agent.id} />}
               size="sm"
             />
             <span className="min-w-0 flex-1 truncate font-medium">

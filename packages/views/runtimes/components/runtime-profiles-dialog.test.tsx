@@ -54,6 +54,7 @@ vi.mock("./delete-runtime-profile-dialog", () => ({
 
 vi.mock("./provider-logo", () => ({
   ProviderLogo: () => null,
+  hasProviderLogo: () => true,
 }));
 
 import { RuntimeProfilesDialog } from "./runtime-profiles-dialog";

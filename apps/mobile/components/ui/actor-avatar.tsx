@@ -88,30 +88,16 @@ function BareAvatar({
   // Only treat a URL as renderable if it actually looks like one — RN <Image>
   // can crash native-side on malformed sources (empty string, plain "foo",
   // etc.). Cheap regex; falsy / bad input falls through to the icon fallback.
+  // An `emoji:<glyph>` sentinel was once written into agent.avatar_url as the
+  // create-time default; MUL-5399 removed that default and cleared the rows, so
+  // there is no emoji branch to render any more. A stale sentinel from a
+  // not-yet-migrated backend fails the URL test below and lands on the initials
+  // chip, which is the right degradation — mobile has no runtime provider marks
+  // to fall back to the way web/desktop do (packages/views/agents/components/
+  // agent-runtime-icon.tsx).
   const rawUrl = type && type !== "system" ? getAvatarUrl(type, id) : null;
-  const emoji = rawUrl?.startsWith("emoji:")
-    ? rawUrl.slice("emoji:".length).trim() || null
-    : null;
   const url =
-    !emoji && rawUrl && /^(https?:|data:|file:|asset:)/.test(rawUrl)
-      ? rawUrl
-      : null;
-
-  if (emoji) {
-    return (
-      <View
-        style={{ width: size, height: size, borderRadius: radius }}
-        className="items-center justify-center bg-muted"
-      >
-        <Text
-          accessibilityLabel={type === "system" ? "" : getName(type, id)}
-          style={{ fontSize: Math.round(size * 0.58), lineHeight: size }}
-        >
-          {emoji}
-        </Text>
-      </View>
-    );
-  }
+    rawUrl && /^(https?:|data:|file:|asset:)/.test(rawUrl) ? rawUrl : null;
 
   if (url) {
     return (

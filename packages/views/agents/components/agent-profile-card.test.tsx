@@ -16,6 +16,8 @@ vi.mock("@multica/core/paths", () => ({
   useWorkspacePaths: () => ({
     agentDetail: (id: string) => `/test/agents/${id}`,
   }),
+  // The avatar's runtime-icon fallback resolves the workspace from here.
+  useCurrentWorkspace: () => ({ id: "ws-1" }),
 }));
 
 vi.mock("@multica/core/api", () => ({

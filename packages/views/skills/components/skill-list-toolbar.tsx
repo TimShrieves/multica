@@ -38,6 +38,7 @@ import {
   TooltipTrigger,
 } from "@multica/ui/components/ui/tooltip";
 import { ActorAvatar } from "@multica/ui/components/common/actor-avatar";
+import { AgentRuntimeIcon } from "../../agents/components/agent-runtime-icon";
 import { FILTER_ITEM_CLASS, HoverCheck } from "../../common/hover-check";
 import {
   type SkillColumnKey,
@@ -337,6 +338,7 @@ export function SkillListToolbar({
                       initials={agent.name.slice(0, 2).toUpperCase()}
                       avatarUrl={resolvePublicFileUrl(agent.avatar_url)}
                       isAgent
+                      fallback={<AgentRuntimeIcon agentId={agent.id} />}
                       size="sm"
                     />
                     <span className="min-w-0 truncate">{agent.name}</span>

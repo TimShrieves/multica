@@ -770,7 +770,10 @@ func TestUpdateAgent_RejectsRenameToArchivedName(t *testing.T) {
 	}
 }
 
-func TestCreateAgent_AssignsAvatarDefault(t *testing.T) {
+// An agent created without an uploaded avatar stores NULL — the UI derives the
+// fallback from the agent's runtime at render time, so the row must not carry a
+// generated placeholder (MUL-5399).
+func TestCreateAgent_LeavesAvatarEmptyWhenNotUploaded(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -779,10 +782,11 @@ func TestCreateAgent_AssignsAvatarDefault(t *testing.T) {
 		name       string
 		avatarURL  *string
 		wantAvatar string
-		wantEmoji  bool
+		wantNull   bool
 	}{
-		{name: "omitted", wantEmoji: true},
-		{name: "empty", avatarURL: ptr(""), wantEmoji: true},
+		{name: "omitted", wantNull: true},
+		{name: "empty", avatarURL: ptr(""), wantNull: true},
+		{name: "blank", avatarURL: ptr("   "), wantNull: true},
 		{
 			name:       "explicit",
 			avatarURL:  ptr("https://cdn.example.com/avatars/agent.png"),
@@ -818,14 +822,14 @@ func TestCreateAgent_AssignsAvatarDefault(t *testing.T) {
 			if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 				t.Fatalf("decode response: %v", err)
 			}
-			if response.AvatarURL == nil {
-				t.Fatal("CreateAgent: avatar_url is nil")
-			}
-			if tt.wantEmoji {
-				if !strings.HasPrefix(*response.AvatarURL, "emoji:") {
-					t.Fatalf("CreateAgent: avatar_url = %q, want emoji avatar", *response.AvatarURL)
+			if tt.wantNull {
+				if response.AvatarURL != nil {
+					t.Fatalf("CreateAgent: avatar_url = %q, want null", *response.AvatarURL)
 				}
 				return
+			}
+			if response.AvatarURL == nil {
+				t.Fatal("CreateAgent: avatar_url is nil")
 			}
 			if *response.AvatarURL != tt.wantAvatar {
 				t.Fatalf("CreateAgent: avatar_url = %q, want %q", *response.AvatarURL, tt.wantAvatar)

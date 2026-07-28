@@ -36,6 +36,7 @@ vi.mock("./model-dropdown", () => ({
 // Provider logos don't matter for these assertions but they pull in SVGs.
 vi.mock("../../runtimes/components/provider-logo", () => ({
   ProviderLogo: () => null,
+  hasProviderLogo: () => true,
 }));
 
 // Avatars hit the api for member metadata.

@@ -50,6 +50,7 @@ import {
   TooltipTrigger,
 } from "@multica/ui/components/ui/tooltip";
 import { ActorAvatar } from "@multica/ui/components/common/actor-avatar";
+import { AgentRuntimeIcon } from "../../agents/components/agent-runtime-icon";
 import { useNavigation, useRowLink } from "../../navigation";
 import {
   CollectionPageHeader,
@@ -275,6 +276,7 @@ function UsedByCell({ agents }: { agents: Agent[] }) {
           initials={agent.name.slice(0, 2).toUpperCase()}
           avatarUrl={resolvePublicFileUrl(agent.avatar_url)}
           isAgent
+          fallback={<AgentRuntimeIcon agentId={agent.id} />}
           size="md"
         />
         <span className="min-w-0 truncate text-xs text-muted-foreground">
@@ -298,6 +300,7 @@ function UsedByCell({ agents }: { agents: Agent[] }) {
                     initials={a.name.slice(0, 2).toUpperCase()}
                     avatarUrl={resolvePublicFileUrl(a.avatar_url)}
                     isAgent
+                    fallback={<AgentRuntimeIcon agentId={a.id} />}
                     size="md"
                   />
                 </span>

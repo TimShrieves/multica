@@ -16,6 +16,7 @@ vi.mock("../../common/actor-avatar", () => ({
 // Provider logos are inline SVGs with no behavior under test.
 vi.mock("../../runtimes/components/provider-logo", () => ({
   ProviderLogo: () => null,
+  hasProviderLogo: () => true,
 }));
 
 import { RuntimePicker } from "./runtime-picker";

@@ -62,6 +62,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@multica/ui/components/ui/tooltip";
+import { AgentRuntimeIcon } from "../../agents/components/agent-runtime-icon";
 import { AppLink, useNavigation } from "../../navigation";
 import { BreadcrumbHeader } from "../../layout/breadcrumb-header";
 import { useCanEditSkill } from "../hooks/use-can-edit-skill";
@@ -179,6 +180,7 @@ function UsedBySection({ agents }: { agents: Agent[] }) {
             initials={a.name.slice(0, 2).toUpperCase()}
             avatarUrl={resolvePublicFileUrl(a.avatar_url)}
             isAgent
+            fallback={<AgentRuntimeIcon agentId={a.id} />}
             size="md"
           />
           <div className="min-w-0 flex-1">

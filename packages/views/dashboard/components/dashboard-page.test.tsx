@@ -179,6 +179,8 @@ vi.mock("@multica/core/paths", () => ({
   useWorkspacePaths: () => ({
     agentDetail: (id: string) => `/acme/agents/${id}`,
   }),
+  // The avatar's runtime-icon fallback resolves the workspace from here.
+  useCurrentWorkspace: () => ({ id: "ws-1" }),
 }));
 
 const tzRef = vi.hoisted(() => ({ current: "UTC" as string | null }));

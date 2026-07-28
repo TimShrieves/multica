@@ -1,0 +1,5 @@
+-- No-op: a cleared avatar_url is indistinguishable from an agent that was
+-- created without one after MUL-5399, so we cannot tell which rows to re-stamp.
+-- Re-generating random emoji for every NULL avatar would hand glyphs to agents
+-- that never had one, which is worse than leaving the column empty — the UI
+-- renders the runtime icon either way.

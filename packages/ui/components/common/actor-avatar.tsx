@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ReactNode } from "react";
 import { Bot, Users } from "lucide-react";
 import { cn } from "@multica/ui/lib/utils";
 import {
@@ -8,7 +8,6 @@ import {
   DEFAULT_AVATAR_SIZE,
   type AvatarSize,
 } from "@multica/ui/lib/avatar-size";
-import { parseAvatarEmoji } from "@multica/ui/lib/avatar-emoji";
 import { MulticaIcon } from "./multica-icon";
 
 interface ActorAvatarProps {
@@ -20,6 +19,15 @@ interface ActorAvatarProps {
   isSquad?: boolean;
   size?: AvatarSize;
   className?: string;
+  /**
+   * Glyph to draw when the actor has no avatar image, in place of the built-in
+   * type icon. `packages/ui` can't reach the workspace directories, so the
+   * caller resolves the identity-specific mark and hands it in — the agent
+   * surfaces pass the icon of the runtime the agent is bound to
+   * (`AgentRuntimeIcon` in packages/views). Rendered inside a square box scaled
+   * to the avatar, so pass something that fills its container (`h-full w-full`).
+   */
+  fallback?: ReactNode;
 }
 
 function ActorAvatar({
@@ -31,10 +39,10 @@ function ActorAvatar({
   isSquad,
   size = DEFAULT_AVATAR_SIZE,
   className,
+  fallback,
 }: ActorAvatarProps) {
   const [imgError, setImgError] = useState(false);
   const px = AVATAR_SIZE_PX[size];
-  const emoji = parseAvatarEmoji(avatarUrl);
 
   useEffect(() => {
     setImgError(false);
@@ -48,7 +56,7 @@ function ActorAvatar({
       data-slot="avatar"
       className={cn(
         "inline-flex shrink-0 items-center justify-center font-medium overflow-hidden",
-        (!avatarUrl || emoji || imgError) && "bg-muted text-muted-foreground",
+        (!avatarUrl || imgError) && "bg-muted text-muted-foreground",
         className,
         // rounded-full stays last so a call-site `className` can never override
         // the circle — avatar shape is a hard invariant, not a per-site choice.
@@ -56,22 +64,20 @@ function ActorAvatar({
       )}
       style={{ width: px, height: px, fontSize: px * 0.45 }}
     >
-      {emoji ? (
-        <span
-          role="img"
-          aria-label={name}
-          className="select-none leading-none"
-          style={{ fontSize: px * 0.58 }}
-        >
-          {emoji}
-        </span>
-      ) : avatarUrl && !imgError ? (
+      {avatarUrl && !imgError ? (
         <img
           src={avatarUrl}
           alt={name}
           className="h-full w-full object-cover"
           onError={() => setImgError(true)}
         />
+      ) : fallback ? (
+        <span
+          className="inline-flex items-center justify-center"
+          style={{ width: px * 0.55, height: px * 0.55 }}
+        >
+          {fallback}
+        </span>
       ) : isSystem ? (
         <MulticaIcon noSpin style={{ width: px * 0.55, height: px * 0.55 }} />
       ) : isAgent ? (

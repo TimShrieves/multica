@@ -13,6 +13,7 @@ import { useAgentPresenceDetail } from "@multica/core/agents";
 import { useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
 import { AgentProfileCard } from "../agents/components/agent-profile-card";
 import { AgentLivePeekCard } from "../agents/components/agent-live-peek-card";
+import { AgentRuntimeIcon } from "../agents/components/agent-runtime-icon";
 import { MemberProfileCard } from "../members/member-profile-card";
 import { SquadProfileCard } from "../squads/components/squad-profile-card";
 import { availabilityConfig } from "../agents/presence";
@@ -89,6 +90,13 @@ export function ActorAvatar({
       isAgent={actorType === "agent"}
       isSystem={actorType === "system"}
       isSquad={actorType === "squad"}
+      // An agent that never uploaded an avatar wears the mark of the runtime
+      // it runs on. The node is only mounted when the base actually falls
+      // back, so members — and agents that do have an avatar — never mount
+      // the runtime lookup.
+      fallback={
+        actorType === "agent" ? <AgentRuntimeIcon agentId={actorId} /> : undefined
+      }
       size={size}
       className={className}
     />

@@ -85,7 +85,10 @@ vi.mock("../../common/use-viewing-timezone", () => ({
   useViewingTimezone: () => "UTC",
 }));
 
-vi.mock("./provider-logo", () => ({ ProviderLogo: () => null }));
+vi.mock("./provider-logo", () => ({
+  ProviderLogo: () => null,
+  hasProviderLogo: () => true,
+}));
 vi.mock("./shared", () => ({
   HealthIcon: () => null,
   useHealthLabel: () => () => "Online",

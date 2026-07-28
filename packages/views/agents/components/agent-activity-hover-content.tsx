@@ -10,6 +10,7 @@ import { agentListOptions } from "@multica/core/workspace/queries";
 import { deriveAgentAvailability } from "@multica/core/agents";
 import type { AgentTask, Issue } from "@multica/core/types";
 import { workloadConfig } from "../presence";
+import { AgentRuntimeIcon } from "./agent-runtime-icon";
 import { useT } from "../../i18n";
 
 interface AgentActivityHoverContentProps {
@@ -103,6 +104,7 @@ function AgentActivityTaskRow({
         initials={getActorInitials("agent", task.agent_id)}
         avatarUrl={getActorAvatarUrl("agent", task.agent_id)}
         isAgent
+        fallback={<AgentRuntimeIcon agentId={task.agent_id} />}
         size="sm"
       />
       <span className="flex-1 truncate font-medium">

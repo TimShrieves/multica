@@ -1,12 +1,11 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Bot, Camera, Loader2, Users, X } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@multica/core/api";
 import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { resolvePublicFileUrl } from "@multica/core/workspace/avatar-url";
-import { parseAvatarEmoji } from "@multica/ui/lib/avatar-emoji";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../i18n";
 import { AvatarCropDialog } from "./avatar-crop-dialog";
@@ -38,6 +37,13 @@ interface AvatarUploadControlProps {
   onClear?: () => void;
   className?: string;
   ariaLabel?: string;
+  /**
+   * Empty-state glyph, replacing the `variant` default. Mirrors `ActorAvatar`'s
+   * `fallback` so the editor previews exactly what the rest of the app will
+   * draw once saved — the agent flows pass the icon of the runtime they're
+   * bound to. Pass something that fills its container (`h-full w-full`).
+   */
+  fallback?: ReactNode;
 }
 
 function initialsOf(name: string): string {
@@ -53,11 +59,23 @@ function AvatarFallback({
   variant,
   name,
   size,
+  fallback,
 }: {
   variant: AvatarUploadVariant;
   name: string;
   size: number;
+  fallback?: ReactNode;
 }) {
+  if (fallback) {
+    return (
+      <span
+        className="inline-flex items-center justify-center"
+        style={{ width: size * 0.5, height: size * 0.5 }}
+      >
+        {fallback}
+      </span>
+    );
+  }
   if (variant === "agent") {
     return <Bot style={{ width: size * 0.5, height: size * 0.5 }} />;
   }
@@ -92,6 +110,7 @@ export function AvatarUploadControl({
   onClear,
   className,
   ariaLabel,
+  fallback,
 }: AvatarUploadControlProps) {
   const { t } = useT("common");
   const { upload } = useFileUpload(api);
@@ -101,10 +120,8 @@ export function AvatarUploadControl({
   const [busy, setBusy] = useState(false);
   const [previewError, setPreviewError] = useState(false);
 
-  const emoji = parseAvatarEmoji(value);
-  const resolved = value && !emoji ? resolvePublicFileUrl(value) : null;
+  const resolved = value ? resolvePublicFileUrl(value) : null;
   const hasImage = !!resolved && !previewError;
-  const hasAvatar = !!emoji || hasImage;
 
   const handlePick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -154,16 +171,7 @@ export function AvatarUploadControl({
         )}
         style={{ width: size, height: size }}
       >
-        {emoji ? (
-          <span
-            role="img"
-            aria-label={name}
-            className="select-none leading-none"
-            style={{ fontSize: size * 0.58 }}
-          >
-            {emoji}
-          </span>
-        ) : hasImage ? (
+        {hasImage ? (
           <img
             src={resolved ?? undefined}
             alt={name}
@@ -171,7 +179,12 @@ export function AvatarUploadControl({
             onError={() => setPreviewError(true)}
           />
         ) : (
-          <AvatarFallback variant={variant} name={name} size={size} />
+          <AvatarFallback
+            variant={variant}
+            name={name}
+            size={size}
+            fallback={fallback}
+          />
         )}
 
         {!disabled && (
@@ -185,7 +198,7 @@ export function AvatarUploadControl({
         )}
       </button>
 
-      {onClear && hasAvatar && !busy && !disabled && (
+      {onClear && hasImage && !busy && !disabled && (
         <button
           type="button"
           onClick={(e) => {

@@ -58,6 +58,7 @@ import {
 } from "@multica/ui/lib/motion";
 import { cn } from "@multica/ui/lib/utils";
 import { AvatarUploadControl } from "../../common/avatar-upload-control";
+import { ProviderAvatarIcon } from "./agent-runtime-icon";
 import { useAppForeground } from "../../common/use-app-foreground";
 import { ChatInput } from "../../chat/components/chat-input";
 import { useChatDraftRestore } from "../../chat/components/use-chat-draft-restore";
@@ -1199,6 +1200,12 @@ function ConfigurationPanel({
                 size={compact ? 52 : 56}
                 onUploaded={(url) => set("avatarUrl", url)}
                 onClear={() => set("avatarUrl", null)}
+                // Preview the face this agent gets if the user never uploads
+                // one — it tracks the runtime picker, so switching runtimes
+                // updates it live.
+                fallback={
+                  <ProviderAvatarIcon provider={selectedRuntime?.provider} />
+                }
               />
             </div>
           </DraftFieldRow>

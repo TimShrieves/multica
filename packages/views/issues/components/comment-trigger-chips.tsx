@@ -15,6 +15,7 @@ import {
 } from "@multica/ui/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@multica/ui/components/ui/tooltip";
 import { cn } from "@multica/ui/lib/utils";
+import { AgentRuntimeIcon } from "../../agents/components/agent-runtime-icon";
 import { AgentStatusDot } from "../../common/actor-avatar";
 import { useT } from "../../i18n";
 import { blockedReasonLabel, blockedShortReasonLabel } from "../blocked-trigger-copy";
@@ -417,6 +418,7 @@ function TriggerAgentAvatar({
         initials=""
         avatarUrl={agent.avatar_url}
         isAgent
+        fallback={<AgentRuntimeIcon agentId={agent.id} />}
         size="xs"
       />
       {showDot && !suppressed && <AgentStatusDot agentId={agent.id} size="xs" />}

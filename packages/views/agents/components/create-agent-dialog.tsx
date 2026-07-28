@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Globe, Lock, Users } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { ProviderAvatarIcon } from "./agent-runtime-icon";
 import { ModelDropdown } from "./model-dropdown";
 import { RuntimePicker, isRuntimeUsableForUser } from "./runtime-picker";
 import { InstructionsEditor } from "./instructions-editor";
@@ -325,6 +326,12 @@ export function CreateAgentDialog({
                 size={64}
                 onUploaded={setAvatarUrl}
                 onClear={() => setAvatarUrl(null)}
+                // Preview the face this agent gets if the user never uploads
+                // one — it tracks the runtime picker below, so switching
+                // runtimes updates it live.
+                fallback={
+                  <ProviderAvatarIcon provider={selectedRuntime?.provider} />
+                }
               />
               <div className="flex-1 min-w-0 space-y-3">
                 <div>
