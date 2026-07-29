@@ -760,6 +760,11 @@ var openclawExec = execOpenclawCLI
 // stderr is captured separately and appended to error messages — failures
 // here surface up to the daemon log, and a `openclaw doctor` hint there is
 // more useful than just an exit code.
+//
+// When the CLI is an npm batch shim that exits non-zero and says nothing at
+// all, openclawShimDiagnostic adds the interpreter-resolution detail that a
+// bare `exit status 1` hides (MUL-5422 / #6061). Real stderr always wins — the
+// diagnostic is a fallback for the silent case, not a replacement.
 func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = os.Environ()
@@ -770,6 +775,9 @@ func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, e
 		stderrMsg := strings.TrimSpace(stderr.String())
 		if stderrMsg != "" {
 			return "", fmt.Errorf("openclaw %s: %w (stderr: %s)", strings.Join(args, " "), err, stderrMsg)
+		}
+		if diag := openclawShimDiagnostic(bin, err); diag != "" {
+			return "", fmt.Errorf("openclaw %s: %w (%s)", strings.Join(args, " "), err, diag)
 		}
 		return "", fmt.Errorf("openclaw %s: %w", strings.Join(args, " "), err)
 	}

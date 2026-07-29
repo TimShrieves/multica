@@ -342,6 +342,22 @@ jobs:
         # blocked forever. -v makes RUN/PASS evidence explicit in CI logs.
         run: go test ./pkg/agent -v -run '^TestCodexWindowsInheritedStdoutDescendantCleanupIsBounded$' -count=1 -timeout=5m
 
+      - name: Test Windows OpenClaw npm shim interpreter resolution
+        working-directory: server
+        # #6061: every OpenClaw task failed execenv prep on a Windows host with
+        # a bare `exit status 1` and no stderr. An npm `.cmd` shim resolves and
+        # runs fine while the `node` it re-execs is unresolvable, so the daemon
+        # cannot distinguish the two without a real cmd.exe host. These tests
+        # pin the positive control (node on PATH → success), the failure being
+        # actionable rather than silent, and that TEMP/TMP are NOT load-bearing
+        # (the originally reported root cause, since retracted upstream).
+        # Scoped to the windows-tagged shim tests — the package's legacy
+        # OpenClaw HOME tests are not Windows-safe; the backend job still runs
+        # the full package plus the cross-platform half on Linux.
+        # -v so a skip (no node on the runner) is visible instead of passing
+        # silently as "ok".
+        run: go test ./internal/daemon/execenv -v -run '^TestWindowsOpenclawShim' -count=1 -timeout=5m
+
       - name: Build Windows CLI helper entrypoint
         working-directory: server
         run: go build ./cmd/multica
