@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
@@ -462,6 +465,296 @@ func TestStrikeFlowContentReplyScopeBindingReplayAndRotation(t *testing.T) {
 		t.Fatalf("revoked credential remained valid = %d, want 401", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+func TestStrikeFlowContentReplySerializesWithLifecycle(t *testing.T) {
+	for lifecycle, key := range map[string]string{
+		"revoke": "00000000-0000-4000-8000-000000000092",
+		"rotate": "00000000-0000-4000-8000-000000000093",
+	} {
+		t.Run(lifecycle, func(t *testing.T) {
+			f := seedStrikeFlowIntegrationFixture(t)
+			body := strikeFlowContentReplyBody(f, key, "Lifecycle race must fail closed.")
+			type requestResult struct {
+				status int
+				err    error
+			}
+			send := func(token, method, path string, requestBody any) <-chan requestResult {
+				result := make(chan requestResult, 1)
+				go func() {
+					var reader io.Reader
+					if requestBody != nil {
+						raw, _ := json.Marshal(requestBody)
+						reader = bytes.NewReader(raw)
+					}
+					req, err := http.NewRequest(method, testServer.URL+path, reader)
+					if err != nil {
+						result <- requestResult{err: err}
+						return
+					}
+					req.Header.Set("Authorization", "Bearer "+token)
+					req.Header.Set("Content-Type", "application/json")
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						result <- requestResult{err: err}
+						return
+					}
+					resp.Body.Close()
+					result <- requestResult{status: resp.StatusCode}
+				}()
+				return result
+			}
+
+			blockerTx, err := testPool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := blockerTx.Exec(t.Context(), `
+				LOCK TABLE strikeflow_connector_content_reply_receipt
+				IN ACCESS EXCLUSIVE MODE
+			`); err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int
+			if err := blockerTx.QueryRow(t.Context(),
+				`SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			releaseBarrier := func() {
+				_ = blockerTx.Rollback(context.Background())
+			}
+			t.Cleanup(releaseBarrier)
+
+			replyResult := send(
+				f.contentReply, http.MethodPost,
+				"/api/integrations/strikeflow/content-replies", body,
+			)
+			deadline := time.Now().Add(3 * time.Second)
+			var replyPID int
+			for time.Now().Before(deadline) {
+				err := testPool.QueryRow(t.Context(), `
+					SELECT pid
+					FROM pg_stat_activity
+					WHERE datname=current_database()
+					  AND $1=ANY(pg_blocking_pids(pid))
+					  AND query LIKE '%INSERT INTO strikeflow_connector_content_reply_receipt%'
+					LIMIT 1
+				`, blockerPID).Scan(&replyPID)
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatal(err)
+				}
+				if replyPID != 0 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if replyPID == 0 {
+				t.Fatal("content reply did not reach the post-token-lock receipt barrier")
+			}
+
+			lifecyclePath := "/api/workspaces/" + testWorkspaceID +
+				"/strikeflow-connector-tokens/" + f.contentTokenID
+			lifecycleMethod := http.MethodDelete
+			var lifecycleBody any
+			wantLifecycle := http.StatusNoContent
+			if lifecycle == "rotate" {
+				lifecycleMethod = http.MethodPost
+				lifecyclePath += "/rotate"
+				lifecycleBody = map[string]any{
+					"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+				}
+				wantLifecycle = http.StatusCreated
+			}
+			lifecycleResult := send(
+				testToken, lifecycleMethod, lifecyclePath, lifecycleBody,
+			)
+			deadline = time.Now().Add(3 * time.Second)
+			lifecycleBlocked := false
+			for time.Now().Before(deadline) {
+				var waits int
+				if err := testPool.QueryRow(t.Context(), `
+					SELECT count(*) FROM pg_stat_activity
+					WHERE datname=current_database()
+					  AND $1=ANY(pg_blocking_pids(pid))
+					  AND query LIKE '%UPDATE strikeflow_connector_token SET revoked_at%'
+				`, replyPID).Scan(&waits); err != nil {
+					t.Fatal(err)
+				}
+				if waits > 0 {
+					lifecycleBlocked = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !lifecycleBlocked {
+				t.Fatal("credential lifecycle did not wait on the content reply token lock")
+			}
+			select {
+			case early := <-lifecycleResult:
+				t.Fatalf("%s returned before content mutation committed: %#v", lifecycle, early)
+			default:
+			}
+
+			if err := blockerTx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			reply := <-replyResult
+			if reply.err != nil {
+				t.Fatal(reply.err)
+			}
+			if reply.status != http.StatusCreated {
+				t.Fatalf("serialized content reply = %d, want 201", reply.status)
+			}
+			completed := <-lifecycleResult
+			if completed.err != nil {
+				t.Fatal(completed.err)
+			}
+			if completed.status != wantLifecycle {
+				t.Fatalf("%s after content commit = %d, want %d",
+					lifecycle, completed.status, wantLifecycle)
+			}
+
+			// Lifecycle has returned. The old credential can no longer enter a
+			// second mutation, and exactly the pre-lifecycle mutation remains.
+			secondKey := "00000000-0000-4000-8000-000000000090"
+			secondBody := strikeFlowContentReplyBody(f, secondKey, "Must not run.")
+			resp := strikeFlowRequest(t, f.contentReply, http.MethodPost,
+				"/api/integrations/strikeflow/content-replies", secondBody)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("old credential after %s = %d, want 401", lifecycle, resp.StatusCode)
+			}
+			resp.Body.Close()
+			var comments, receipts int
+			marker := "[strikeflow-content-reply:" + key + "]"
+			if err := testPool.QueryRow(t.Context(), `
+				SELECT count(*) FROM comment
+				WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+			`, f.issueID, marker).Scan(&comments); err != nil {
+				t.Fatal(err)
+			}
+			if err := testPool.QueryRow(t.Context(), `
+				SELECT count(*) FROM strikeflow_connector_content_reply_receipt
+				WHERE idempotency_key=$1 AND issue_id=$2
+			`, key, f.issueID).Scan(&receipts); err != nil {
+				t.Fatal(err)
+			}
+			if comments != 1 || receipts != 1 {
+				t.Fatalf("serialized effects: comments=%d receipts=%d", comments, receipts)
+			}
+		})
+	}
+}
+
+func TestStrikeFlowContentReplyRecoversContinuationAfterEnqueueFailure(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	key := "00000000-0000-4000-8000-000000000091"
+	body := strikeFlowContentReplyBody(f, key, "Retry the continuation safely.")
+	constraintSQL := fmt.Sprintf(`
+		ALTER TABLE agent_task_queue
+		ADD CONSTRAINT strikeflow_test_reject_content_trigger
+		CHECK (issue_id IS DISTINCT FROM '%s'::uuid OR trigger_comment_id IS NULL)
+		NOT VALID
+	`, f.issueID)
+	if _, err := testPool.Exec(t.Context(), constraintSQL); err != nil {
+		t.Fatal(err)
+	}
+	dropConstraint := func() {
+		_, _ = testPool.Exec(context.Background(), `
+			ALTER TABLE agent_task_queue
+			DROP CONSTRAINT IF EXISTS strikeflow_test_reject_content_trigger
+		`)
+	}
+	t.Cleanup(dropConstraint)
+
+	resp := strikeFlowRequest(t, f.contentReply, http.MethodPost,
+		"/api/integrations/strikeflow/content-replies", body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first enqueue failure = %d, want 503", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var comments, receipts, tasks int
+	marker := "[strikeflow-content-reply:" + key + "]"
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM comment
+		WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+	`, f.issueID, marker).Scan(&comments); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_connector_content_reply_receipt
+		WHERE idempotency_key=$1 AND issue_id=$2 AND comment_id IS NOT NULL
+	`, key, f.issueID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM agent_task_queue
+		WHERE issue_id=$1 AND trigger_comment_id IN (
+			SELECT id FROM comment
+			WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+		)
+	`, f.issueID, marker).Scan(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if comments != 1 || receipts != 1 || tasks != 0 {
+		t.Fatalf("failed enqueue state: comments=%d receipts=%d tasks=%d",
+			comments, receipts, tasks)
+	}
+
+	dropConstraint()
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost,
+		"/api/integrations/strikeflow/content-replies", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recovery replay = %d, want 200", resp.StatusCode)
+	}
+	var recovered struct {
+		Data struct {
+			CommentID string         `json:"comment_id"`
+			TaskID    string         `json:"task_id"`
+			Task      map[string]any `json:"task"`
+		} `json:"data"`
+	}
+	readJSON(t, resp, &recovered)
+	if recovered.Data.CommentID == "" || recovered.Data.TaskID == "" ||
+		recovered.Data.Task["agent_id"] != f.agentID ||
+		recovered.Data.Task["originator_user_id"] != testUserID ||
+		recovered.Data.Task["accountable_user_id"] != testUserID {
+		t.Fatalf("recovered continuation attribution mismatch: %#v", recovered.Data)
+	}
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost,
+		"/api/integrations/strikeflow/content-replies", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stable replay = %d, want 200", resp.StatusCode)
+	}
+	var stable struct {
+		Data struct {
+			CommentID string `json:"comment_id"`
+			TaskID    string `json:"task_id"`
+		} `json:"data"`
+	}
+	readJSON(t, resp, &stable)
+	if stable.Data.CommentID != recovered.Data.CommentID ||
+		stable.Data.TaskID != recovered.Data.TaskID {
+		t.Fatalf("stable replay diverged: recovered=%#v stable=%#v",
+			recovered.Data, stable.Data)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM agent_task_queue
+		WHERE issue_id=$1 AND trigger_comment_id IN (
+			SELECT id FROM comment
+			WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+		)
+	`, f.issueID, marker).Scan(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM comment
+		WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+	`, f.issueID, marker).Scan(&comments); err != nil {
+		t.Fatal(err)
+	}
+	if comments != 1 || tasks != 1 {
+		t.Fatalf("recovery duplicated effects: comments=%d tasks=%d", comments, tasks)
+	}
 }
 
 func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {

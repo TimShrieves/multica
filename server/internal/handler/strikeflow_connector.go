@@ -207,6 +207,9 @@ func (h *Handler) RevokeStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	// Credential lifecycle locks the token row first. Content reply mutation
+	// uses the same first lock, then source/receipt rows, preventing deadlocks
+	// and ensuring no reply mutation can commit after this UPDATE returns.
 	tag, err := h.DB.Exec(r.Context(), `
 		UPDATE strikeflow_connector_token SET revoked_at=COALESCE(revoked_at,now())
 		WHERE id=$1 AND workspace_id=$2
@@ -256,6 +259,8 @@ func (h *Handler) RotateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 		return
 	}
 	defer tx.Rollback(r.Context())
+	// Lock order matches content replies: old token row first. The UPDATE in
+	// the CTE obtains that lock before the replacement row is inserted.
 	var newID, recipientID, agentID pgtype.UUID
 	var name string
 	var projects []pgtype.UUID

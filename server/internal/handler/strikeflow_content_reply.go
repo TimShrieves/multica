@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -130,29 +132,53 @@ func (h *Handler) ReplyStrikeFlowContentPackage(w http.ResponseWriter, r *http.R
 	}
 	defer tx.Rollback(r.Context())
 
-	// One authoritative query rechecks the live token, member, agent, project,
-	// issue and top-level root inside the mutation transaction. Body fields can
-	// only narrow this database authority; they cannot widen it.
+	// Lock order is invariant across content replies and credential lifecycle:
+	// connector token first, then member/agent/source rows, then receipt/comment.
+	// Revoke and rotate UPDATE the same token row before touching anything else.
+	// Therefore either this mutation commits before lifecycle returns, or it
+	// observes the revoked/rotated row and performs no mutation.
+	var tokenLocked bool
+	err = tx.QueryRow(r.Context(), `
+		SELECT true
+		FROM strikeflow_connector_token
+		WHERE id=$1 AND revoked_at IS NULL AND expires_at > now()
+		  AND workspace_id=$2 AND recipient_id=$3 AND agent_id=$4
+		  AND scopes=ARRAY['content:reply']::text[]
+		  AND cardinality(project_ids)=1 AND $5=ANY(project_ids)
+		FOR UPDATE
+	`, scope.TokenID, scope.WorkspaceID, scope.RecipientID,
+		scope.AgentID, projectID).Scan(&tokenLocked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "content reply source not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to lock connector token")
+		return
+	}
+	if !tokenLocked {
+		writeError(w, http.StatusInternalServerError, "failed to lock connector token")
+		return
+	}
+
+	// Body fields can only narrow this database authority; they cannot widen it.
 	var bindingOK bool
 	err = tx.QueryRow(r.Context(), `
 		SELECT EXISTS(
 			SELECT 1
-			FROM strikeflow_connector_token sct
-			JOIN member m ON m.workspace_id=sct.workspace_id AND m.user_id=sct.recipient_id
-			JOIN agent a ON a.id=sct.agent_id AND a.workspace_id=sct.workspace_id
-			JOIN issue i ON i.id=$2 AND i.workspace_id=sct.workspace_id
-			JOIN comment c ON c.id=$3 AND c.issue_id=i.id AND c.workspace_id=i.workspace_id
-			WHERE sct.id=$1 AND sct.revoked_at IS NULL AND sct.expires_at > now()
-			  AND sct.workspace_id=$4 AND sct.recipient_id=$5 AND sct.agent_id=$6
-			  AND sct.scopes=ARRAY['content:reply']::text[]
-			  AND $7=ANY(sct.project_ids) AND i.project_id=$7
-			  AND i.assignee_type='agent' AND i.assignee_id=sct.agent_id
+			FROM member m
+			JOIN agent a ON a.id=$3 AND a.workspace_id=m.workspace_id
+			JOIN issue i ON i.id=$4 AND i.workspace_id=m.workspace_id
+			JOIN comment c ON c.id=$5 AND c.issue_id=i.id AND c.workspace_id=i.workspace_id
+			WHERE m.workspace_id=$1 AND m.user_id=$2
+			  AND i.project_id=$6
+			  AND i.assignee_type='agent' AND i.assignee_id=a.id
 			  AND i.status IN ('in_review','in_progress','done')
 			  AND a.archived_at IS NULL
-			  AND c.parent_id IS NULL AND c.author_type='agent' AND c.author_id=sct.agent_id
+			  AND c.parent_id IS NULL AND c.author_type='agent' AND c.author_id=a.id
 		)
-	`, scope.TokenID, issueID, rootID, scope.WorkspaceID, scope.RecipientID,
-		scope.AgentID, projectID).Scan(&bindingOK)
+	`, scope.WorkspaceID, scope.RecipientID, scope.AgentID,
+		issueID, rootID, projectID).Scan(&bindingOK)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to validate content reply")
 		return
@@ -272,12 +298,18 @@ func (h *Handler) ReplyStrikeFlowContentPackage(w http.ResponseWriter, r *http.R
 		h.TaskService.AutoUnresolveThreadOnReply(
 			r.Context(), &parent, scope.WorkspaceID, "member", scope.RecipientID,
 		)
+	}
+	task := h.strikeFlowContentReplyTaskReceipt(r, issueID, comment.ID, scope.AgentID)
+	if task == nil {
+		// Enqueue is intentionally recoverable after the durable comment commit.
+		// A serial replay first queries by the exact trigger; enqueue admission
+		// coalesces or blocks while a matching issue-agent task is active.
 		_ = h.triggerTasksForComment(
 			r.Context(), issue, comment, &parent,
 			"member", scope.RecipientID, scope.RecipientID, "", nil,
 		)
+		task = h.strikeFlowContentReplyTaskReceipt(r, issueID, comment.ID, scope.AgentID)
 	}
-	task := h.strikeFlowContentReplyTaskReceipt(r, issueID, comment.ID, scope.AgentID)
 	if task == nil {
 		// The durable comment and idempotency receipt are already committed.
 		// A retry replays them and can recover the continuation receipt without
