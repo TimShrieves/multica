@@ -21,8 +21,8 @@ var openclawShimExtensions = map[string]struct{}{
 
 // openclawShimInterpreter is the interpreter an npm-installed OpenClaw shim
 // re-execs. OpenClaw's package `bin` entry points at `openclaw.mjs`, whose
-// shebang is `#!/usr/bin/env node`, so a missing `node` breaks the shim from
-// the inside while the shim itself still looks perfectly valid to the daemon.
+// shebang is `#!/usr/bin/env node`, so an unreachable `node` breaks the shim
+// from the inside while the shim itself still looks valid to the daemon.
 const openclawShimInterpreter = "node"
 
 // isOpenclawShimPath reports whether bin is a batch shim rather than a directly
@@ -32,10 +32,50 @@ const openclawShimInterpreter = "node"
 // `.cmd`/`.bat` shim only ever appears on Windows in production, and testing
 // the extension instead of the host OS lets the whole diagnostic be exercised
 // from the normal Linux/macOS test job rather than only on a Windows runner.
+//
+// A batch extension is NOT proof the file is an npm shim — an operator can
+// point MULTICA_OPENCLAW_PATH at any batch file. The diagnostic below is
+// therefore phrased conditionally and never asserts npm shim semantics as fact.
 func isOpenclawShimPath(bin string) bool {
 	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(bin)))
 	_, ok := openclawShimExtensions[ext]
 	return ok
+}
+
+// openclawInterpreterOrigin describes where a shim's interpreter was found,
+// without disclosing an absolute path. See openclawShimDiagnostic for why the
+// path itself is withheld.
+type openclawInterpreterOrigin struct {
+	found bool
+	// where is a human phrase ("alongside the shim", "on the daemon PATH"),
+	// empty when the interpreter was not found at all.
+	where string
+}
+
+// findOpenclawShimInterpreter resolves the interpreter the way npm's generated
+// shim does, in npm's own order.
+//
+// npm's cmd-shim template emits:
+//
+//	IF EXIST "%dp0%\node.exe" ( SET "_prog=%dp0%\node.exe" ) ELSE ( SET "_prog=node" )
+//
+// so a Node binary sitting next to the shim wins over PATH entirely. Checking
+// only PATH (as the first version of this diagnostic did) would report "node is
+// not resolvable" for an install that actually runs fine off its co-located
+// interpreter — a confidently wrong root cause, which is worse than no hint.
+func findOpenclawShimInterpreter(shimPath string) openclawInterpreterOrigin {
+	dir := filepath.Dir(shimPath)
+	// `.exe` first, matching npm's IF EXIST check; the bare name keeps the
+	// helper meaningful on the non-Windows hosts the tests run on.
+	for _, name := range []string{openclawShimInterpreter + ".exe", openclawShimInterpreter} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err == nil && !info.IsDir() {
+			return openclawInterpreterOrigin{found: true, where: "alongside the shim"}
+		}
+	}
+	if _, err := exec.LookPath(openclawShimInterpreter); err == nil {
+		return openclawInterpreterOrigin{found: true, where: "on the daemon PATH"}
+	}
+	return openclawInterpreterOrigin{}
 }
 
 // openclawShimDiagnostic explains a batch-shim invocation that failed without
@@ -44,28 +84,34 @@ func isOpenclawShimPath(bin string) bool {
 // Why this exists (MUL-5422 / #6061): a Windows user reported every OpenClaw
 // task failing in execenv prep with a bare `exit status 1` and no stderr. The
 // daemon pins `openclaw` to an absolute path, so the failing command looked
-// correct; what the error could not show is that the shim's own `node` lookup
-// is a second, invisible resolution step that can fail independently. The
-// reporter needed hand-run `subprocess` experiments to discover that, which is
-// exactly the diagnostic the daemon should have handed them.
+// correct; what the error could not show is that a shim's interpreter lookup is
+// a second, invisible resolution step that can fail on its own.
 //
-// This only enriches the error text — it never changes control flow, and it
-// never suppresses a real stderr message (callers try stderr first). It also
-// deliberately reports the interpreter lookup result in BOTH directions:
+// Scope note: CI on windows-latest showed that when `node` is genuinely missing,
+// cmd.exe's "'node' is not recognized" DOES reach Go's stderr pipe, so that case
+// takes the caller's stderr branch and never arrives here. This diagnostic is
+// the fallback for a shim that fails while saying nothing at all — which is what
+// #6061's daemon log actually showed, and remains unexplained.
 //
-//   - interpreter missing → names it as the likely cause, with a fix hint.
-//   - interpreter present → says so, which is the more valuable evidence. It
-//     rules the PATH theory out and points at the remaining hypotheses (PATH
-//     drift between the runtime's `--version` gate and task prep, a broken
-//     OpenClaw install, or a shim failing for an unrelated reason).
+// This only enriches error text — it never changes control flow, and never
+// suppresses a real stderr message (callers try stderr first).
 //
-// The PATH itself is summarised as an entry count rather than dumped: this
-// string lands in daemon logs and issue reports, and a full PATH is both noisy
-// and more environment detail than a bug report needs.
+// # Redaction
+//
+// The returned string is NOT local-log-only: on prep failure it travels through
+// reportTerminalTask → Client.FailTask to the server and is persisted as the
+// task's error. A Windows shim path embeds the account name and install layout
+// (`C:\Users\<name>\AppData\Roaming\npm\...`), so this reports only the shim's
+// base name, whether the interpreter resolved, and a PATH entry count — never an
+// absolute path and never the PATH contents.
 func openclawShimDiagnostic(bin string, runErr error) string {
-	// Only an actual non-zero exit is in scope. A context deadline, a missing
-	// binary, or a permission error already describes itself, and appending an
-	// interpreter lookup to those would be misleading noise.
+	// Only an actual non-zero exit is in scope. A missing binary or permission
+	// error already describes itself.
+	//
+	// Note this gate is necessary but NOT sufficient: a context timeout kills
+	// the child and also surfaces as *exec.ExitError ("signal: killed"), which
+	// would be misdiagnosed here as an interpreter problem. Callers must
+	// attribute context cancellation before consulting this function.
 	var exitErr *exec.ExitError
 	if !errors.As(runErr, &exitErr) {
 		return ""
@@ -74,29 +120,31 @@ func openclawShimDiagnostic(bin string, runErr error) string {
 		return ""
 	}
 
-	// LookPath reads the current process PATH, which is the same environment
-	// execOpenclawCLI hands the child via os.Environ() — so this reports the
-	// interpreter visibility the shim actually had, not a different view.
+	name := filepath.Base(strings.TrimSpace(bin))
 	pathSummary := openclawPathEntrySummary()
-	interpreterPath, lookErr := exec.LookPath(openclawShimInterpreter)
-	if lookErr != nil {
+	origin := findOpenclawShimInterpreter(bin)
+	if !origin.found {
 		return fmt.Sprintf(
-			"no stderr output; %s shim %s re-execs %q, which is not resolvable on the daemon PATH (%s) — "+
-				"install Node.js or restart the daemon from an environment where %q is on PATH",
-			strings.ToLower(filepath.Ext(bin)), bin, openclawShimInterpreter, pathSummary, openclawShimInterpreter,
+			"no stderr output; if %s is an npm-generated shim it re-execs %q, which resolves neither "+
+				"alongside the shim nor on the daemon PATH (%s) — install Node.js, or restart the daemon "+
+				"from an environment where %q is on PATH",
+			name, openclawShimInterpreter, pathSummary, openclawShimInterpreter,
 		)
 	}
+	// The interpreter being reachable is the more valuable report: it clears
+	// PATH of blame and redirects to the remaining hypotheses (PATH drift
+	// between the runtime `--version` gate and task prep, or a broken install).
 	return fmt.Sprintf(
-		"no stderr output; %s shim %s failed even though %q resolves to %s on the daemon PATH (%s) — "+
-			"the interpreter is reachable, so check the OpenClaw install itself",
-		strings.ToLower(filepath.Ext(bin)), bin, openclawShimInterpreter, interpreterPath, pathSummary,
+		"no stderr output; %q resolves %s, so the interpreter is reachable — if %s is an "+
+			"npm-generated shim, check the OpenClaw install itself rather than the daemon PATH (%s)",
+		openclawShimInterpreter, origin.where, name, pathSummary,
 	)
 }
 
 // openclawPathEntrySummary describes the daemon PATH by size alone. A count is
 // enough to tell "the daemon inherited a stripped environment" apart from "PATH
 // looks normal but the interpreter still is not on it", without copying the
-// user's full PATH into a daemon log or a pasted bug report.
+// user's PATH into a task error that is persisted server-side.
 func openclawPathEntrySummary() string {
 	if n := len(filepath.SplitList(os.Getenv("PATH"))); n != 1 {
 		return fmt.Sprintf("%d entries", n)

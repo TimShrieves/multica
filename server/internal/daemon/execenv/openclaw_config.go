@@ -761,10 +761,17 @@ var openclawExec = execOpenclawCLI
 // here surface up to the daemon log, and a `openclaw doctor` hint there is
 // more useful than just an exit code.
 //
-// When the CLI is an npm batch shim that exits non-zero and says nothing at
-// all, openclawShimDiagnostic adds the interpreter-resolution detail that a
-// bare `exit status 1` hides (MUL-5422 / #6061). Real stderr always wins — the
+// When the CLI is a batch shim that exits non-zero and says nothing at all,
+// openclawShimDiagnostic adds the interpreter-resolution detail that a bare
+// `exit status 1` hides (MUL-5422 / #6061). Real stderr always wins — the
 // diagnostic is a fallback for the silent case, not a replacement.
+//
+// Attribution order matters. openclawCLITimeout kills the child via
+// CommandContext, and a killed process surfaces as *exec.ExitError
+// ("signal: killed") — indistinguishable by type from a genuine exit 1. So the
+// context is checked FIRST; otherwise a timeout gets reported as "node is not
+// on PATH, install Node.js", sending the user to fix something that was never
+// broken.
 func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = os.Environ()
@@ -773,6 +780,12 @@ func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, e
 	raw, err := cmd.Output()
 	if err != nil {
 		stderrMsg := strings.TrimSpace(stderr.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if stderrMsg != "" {
+				return "", fmt.Errorf("openclaw %s: %w (%v; stderr: %s)", strings.Join(args, " "), err, ctxErr, stderrMsg)
+			}
+			return "", fmt.Errorf("openclaw %s: %w (%v)", strings.Join(args, " "), err, ctxErr)
+		}
 		if stderrMsg != "" {
 			return "", fmt.Errorf("openclaw %s: %w (stderr: %s)", strings.Join(args, " "), err, stderrMsg)
 		}
