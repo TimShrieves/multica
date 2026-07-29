@@ -645,6 +645,221 @@ func TestStrikeFlowContentReplySerializesWithLifecycle(t *testing.T) {
 	}
 }
 
+func TestStrikeFlowContentReplySerializesWithSourceAuthorizationChanges(t *testing.T) {
+	type sourceRace struct {
+		key, denyKey string
+		sql, pattern string
+		args         func(strikeFlowIntegrationFixture) []any
+		cleanup      func(*testing.T, strikeFlowIntegrationFixture)
+		allowPending bool
+	}
+	cases := map[string]sourceRace{
+		"project_move": {
+			key:     "00000000-0000-4000-8000-000000000081",
+			denyKey: "00000000-0000-4000-8000-000000000071",
+			sql:     `/* strikeflow_source_race_project_move */ UPDATE issue SET project_id=$2 WHERE id=$1`,
+			pattern: "%strikeflow_source_race_project_move%",
+			args: func(f strikeFlowIntegrationFixture) []any {
+				return []any{f.issueID, f.otherProjectID}
+			},
+		},
+		"reassignment": {
+			key:     "00000000-0000-4000-8000-000000000082",
+			denyKey: "00000000-0000-4000-8000-000000000072",
+			sql: `/* strikeflow_source_race_reassignment */
+				UPDATE issue SET assignee_type='member',assignee_id=$2 WHERE id=$1`,
+			pattern: "%strikeflow_source_race_reassignment%",
+			args: func(f strikeFlowIntegrationFixture) []any {
+				return []any{f.issueID, testUserID}
+			},
+		},
+		"agent_archive": {
+			key:          "00000000-0000-4000-8000-000000000083",
+			denyKey:      "00000000-0000-4000-8000-000000000073",
+			sql:          `/* strikeflow_source_race_agent_archive */ UPDATE agent SET archived_at=now() WHERE id=$1`,
+			pattern:      "%strikeflow_source_race_agent_archive%",
+			allowPending: true,
+			args: func(f strikeFlowIntegrationFixture) []any {
+				return []any{f.agentID}
+			},
+			cleanup: func(t *testing.T, f strikeFlowIntegrationFixture) {
+				_, _ = testPool.Exec(context.Background(),
+					`UPDATE agent SET archived_at=NULL WHERE id=$1`, f.agentID)
+			},
+		},
+		"member_removal": {
+			key:     "00000000-0000-4000-8000-000000000084",
+			denyKey: "00000000-0000-4000-8000-000000000074",
+			sql: `/* strikeflow_source_race_member_removal */
+				DELETE FROM member WHERE workspace_id=$1 AND user_id=$2`,
+			pattern: "%strikeflow_source_race_member_removal%",
+			args: func(f strikeFlowIntegrationFixture) []any {
+				return []any{testWorkspaceID, testUserID}
+			},
+			cleanup: func(t *testing.T, f strikeFlowIntegrationFixture) {
+				_, _ = testPool.Exec(context.Background(), `
+					INSERT INTO member(workspace_id,user_id,role)
+					VALUES($1,$2,'owner') ON CONFLICT DO NOTHING
+				`, testWorkspaceID, testUserID)
+			},
+		},
+		"root_author_change": {
+			key:     "00000000-0000-4000-8000-000000000085",
+			denyKey: "00000000-0000-4000-8000-000000000075",
+			sql: `/* strikeflow_source_race_root_author */
+				UPDATE comment SET author_type='member',author_id=$2 WHERE id=$1`,
+			pattern: "%strikeflow_source_race_root_author%",
+			args: func(f strikeFlowIntegrationFixture) []any {
+				return []any{f.rootID, testUserID}
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := seedStrikeFlowIntegrationFixture(t)
+			if tc.cleanup != nil {
+				t.Cleanup(func() { tc.cleanup(t, f) })
+			}
+			body := strikeFlowContentReplyBody(f, tc.key, "Authorize against locked source state.")
+
+			blockerTx, err := testPool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := blockerTx.Exec(t.Context(), `
+				LOCK TABLE strikeflow_connector_content_reply_receipt
+				IN ACCESS EXCLUSIVE MODE
+			`); err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int
+			if err := blockerTx.QueryRow(t.Context(),
+				`SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = blockerTx.Rollback(context.Background()) })
+
+			type httpResult struct {
+				status int
+				err    error
+			}
+			replyResult := make(chan httpResult, 1)
+			go func() {
+				raw, _ := json.Marshal(body)
+				req, requestErr := http.NewRequest(
+					http.MethodPost,
+					testServer.URL+"/api/integrations/strikeflow/content-replies",
+					bytes.NewReader(raw),
+				)
+				if requestErr != nil {
+					replyResult <- httpResult{err: requestErr}
+					return
+				}
+				req.Header.Set("Authorization", "Bearer "+f.contentReply)
+				req.Header.Set("Content-Type", "application/json")
+				httpResp, requestErr := http.DefaultClient.Do(req)
+				if requestErr != nil {
+					replyResult <- httpResult{err: requestErr}
+					return
+				}
+				httpResp.Body.Close()
+				replyResult <- httpResult{status: httpResp.StatusCode}
+			}()
+
+			deadline := time.Now().Add(3 * time.Second)
+			var replyPID int
+			for time.Now().Before(deadline) {
+				err := testPool.QueryRow(t.Context(), `
+					SELECT pid FROM pg_stat_activity
+					WHERE datname=current_database()
+					  AND $1=ANY(pg_blocking_pids(pid))
+					  AND query LIKE '%INSERT INTO strikeflow_connector_content_reply_receipt%'
+					LIMIT 1
+				`, blockerPID).Scan(&replyPID)
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatal(err)
+				}
+				if replyPID != 0 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if replyPID == 0 {
+				t.Fatal("content reply did not reach the post-source-lock barrier")
+			}
+
+			mutationResult := make(chan error, 1)
+			go func() {
+				_, mutationErr := testPool.Exec(context.Background(), tc.sql, tc.args(f)...)
+				mutationResult <- mutationErr
+			}()
+			deadline = time.Now().Add(3 * time.Second)
+			mutationBlocked := false
+			for time.Now().Before(deadline) {
+				var waits int
+				if err := testPool.QueryRow(t.Context(), `
+					SELECT count(*) FROM pg_stat_activity
+					WHERE datname=current_database()
+					  AND $1=ANY(pg_blocking_pids(pid))
+					  AND query LIKE $2
+				`, replyPID, tc.pattern).Scan(&waits); err != nil {
+					t.Fatal(err)
+				}
+				if waits > 0 {
+					mutationBlocked = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !mutationBlocked {
+				t.Fatal("source authorization change did not wait on the reply lock")
+			}
+			select {
+			case early := <-mutationResult:
+				t.Fatalf("source change returned before reply commit: %v", early)
+			default:
+			}
+
+			if err := blockerTx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			reply := <-replyResult
+			if reply.err != nil {
+				t.Fatal(reply.err)
+			}
+			// Archival may win immediately after the durable comment commit and
+			// prevent its post-commit continuation; 503 reports that exact
+			// durable-comment/pending-continuation state.
+			if reply.status != http.StatusCreated &&
+				!(tc.allowPending && reply.status == http.StatusServiceUnavailable) {
+				t.Fatalf("serialized source reply = %d, want 201", reply.status)
+			}
+			if err := <-mutationResult; err != nil {
+				t.Fatal(err)
+			}
+
+			denyBody := strikeFlowContentReplyBody(f, tc.denyKey, "Must fail after source change.")
+			resp := strikeFlowRequest(t, f.contentReply, http.MethodPost,
+				"/api/integrations/strikeflow/content-replies", denyBody)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("reply after source change = %d, want 404", resp.StatusCode)
+			}
+			resp.Body.Close()
+			var comments int
+			marker := "[strikeflow-content-reply:" + tc.key + "]"
+			if err := testPool.QueryRow(t.Context(), `
+				SELECT count(*) FROM comment
+				WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+			`, f.issueID, marker).Scan(&comments); err != nil {
+				t.Fatal(err)
+			}
+			if comments != 1 {
+				t.Fatalf("source race comments=%d, want 1", comments)
+			}
+		})
+	}
+}
+
 func TestStrikeFlowContentReplyRecoversContinuationAfterEnqueueFailure(t *testing.T) {
 	f := seedStrikeFlowIntegrationFixture(t)
 	key := "00000000-0000-4000-8000-000000000091"
@@ -701,41 +916,214 @@ func TestStrikeFlowContentReplyRecoversContinuationAfterEnqueueFailure(t *testin
 	}
 
 	dropConstraint()
-	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost,
-		"/api/integrations/strikeflow/content-replies", body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("recovery replay = %d, want 200", resp.StatusCode)
+	rotatePath := "/api/workspaces/" + testWorkspaceID +
+		"/strikeflow-connector-tokens/" + f.contentTokenID + "/rotate"
+	resp = strikeFlowRequest(t, testToken, http.MethodPost, rotatePath, map[string]any{
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("content credential rotate = %d, want 201", resp.StatusCode)
 	}
-	var recovered struct {
-		Data struct {
+	var rotated struct {
+		Token string `json:"token"`
+	}
+	readJSON(t, resp, &rotated)
+
+	lockKey := int64(905091)
+	lockConn, err := testPool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.Exec(t.Context(), `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	unlock := func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockKey)
+			locked = false
+		}
+	}
+	t.Cleanup(func() {
+		unlock()
+		lockConn.Release()
+	})
+	if _, err := testPool.Exec(t.Context(), fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION strikeflow_test_block_continuation_receipt()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.issue_id = '%s'::uuid AND NEW.continuation_task_id IS NOT NULL THEN
+				PERFORM pg_advisory_xact_lock(%d);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER strikeflow_test_block_continuation_receipt
+			BEFORE UPDATE OF continuation_task_id
+			ON strikeflow_connector_content_reply_receipt
+			FOR EACH ROW EXECUTE FUNCTION strikeflow_test_block_continuation_receipt()
+	`, f.issueID, lockKey)); err != nil {
+		t.Fatal(err)
+	}
+	dropTrigger := func() {
+		_, _ = testPool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS strikeflow_test_block_continuation_receipt
+				ON strikeflow_connector_content_reply_receipt;
+			DROP FUNCTION IF EXISTS strikeflow_test_block_continuation_receipt()
+		`)
+	}
+	t.Cleanup(dropTrigger)
+
+	type recoveryResponse struct {
+		status int
+		data   struct {
 			CommentID string         `json:"comment_id"`
 			TaskID    string         `json:"task_id"`
 			Task      map[string]any `json:"task"`
-		} `json:"data"`
+		}
+		err error
 	}
-	readJSON(t, resp, &recovered)
-	if recovered.Data.CommentID == "" || recovered.Data.TaskID == "" ||
-		recovered.Data.Task["agent_id"] != f.agentID ||
-		recovered.Data.Task["originator_user_id"] != testUserID ||
-		recovered.Data.Task["accountable_user_id"] != testUserID {
-		t.Fatalf("recovered continuation attribution mismatch: %#v", recovered.Data)
+	sendRecovery := func() <-chan recoveryResponse {
+		result := make(chan recoveryResponse, 1)
+		go func() {
+			raw, _ := json.Marshal(body)
+			req, requestErr := http.NewRequest(
+				http.MethodPost, testServer.URL+"/api/integrations/strikeflow/content-replies",
+				bytes.NewReader(raw),
+			)
+			if requestErr != nil {
+				result <- recoveryResponse{err: requestErr}
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+rotated.Token)
+			req.Header.Set("Content-Type", "application/json")
+			httpResp, requestErr := http.DefaultClient.Do(req)
+			if requestErr != nil {
+				result <- recoveryResponse{err: requestErr}
+				return
+			}
+			defer httpResp.Body.Close()
+			var envelope struct {
+				Data struct {
+					CommentID string         `json:"comment_id"`
+					TaskID    string         `json:"task_id"`
+					Task      map[string]any `json:"task"`
+				} `json:"data"`
+			}
+			if decodeErr := json.NewDecoder(httpResp.Body).Decode(&envelope); decodeErr != nil {
+				result <- recoveryResponse{status: httpResp.StatusCode, err: decodeErr}
+				return
+			}
+			result <- recoveryResponse{status: httpResp.StatusCode, data: envelope.Data}
+		}()
+		return result
 	}
-	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost,
-		"/api/integrations/strikeflow/content-replies", body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("stable replay = %d, want 200", resp.StatusCode)
+
+	firstResult := sendRecovery()
+	deadline := time.Now().Add(3 * time.Second)
+	var recoveryPID int
+	for time.Now().Before(deadline) {
+		err := testPool.QueryRow(t.Context(), `
+			SELECT pid FROM pg_stat_activity
+			WHERE datname=current_database()
+			  AND $1=ANY(pg_blocking_pids(pid))
+			  AND query LIKE '%UPDATE strikeflow_connector_content_reply_receipt%'
+			LIMIT 1
+		`, lockConn.Conn().PgConn().PID()).Scan(&recoveryPID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		if recoveryPID != 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	var stable struct {
-		Data struct {
-			CommentID string `json:"comment_id"`
-			TaskID    string `json:"task_id"`
-		} `json:"data"`
+	if recoveryPID == 0 {
+		t.Fatal("first recovery did not reach continuation receipt barrier")
 	}
-	readJSON(t, resp, &stable)
-	if stable.Data.CommentID != recovered.Data.CommentID ||
-		stable.Data.TaskID != recovered.Data.TaskID {
-		t.Fatalf("stable replay diverged: recovered=%#v stable=%#v",
-			recovered.Data, stable.Data)
+
+	secondResult := sendRecovery()
+	deadline = time.Now().Add(3 * time.Second)
+	secondBlocked := false
+	for time.Now().Before(deadline) {
+		var waits int
+		if err := testPool.QueryRow(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname=current_database()
+			  AND $1=ANY(pg_blocking_pids(pid))
+			  AND query LIKE '%strikeflow_connector_content_reply_receipt%'
+		`, recoveryPID).Scan(&waits); err != nil {
+			t.Fatal(err)
+		}
+		if waits > 0 {
+			secondBlocked = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !secondBlocked {
+		t.Fatal("concurrent same-key recovery did not wait on the receipt row")
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT id FROM agent_task_queue
+		WHERE issue_id=$1 AND trigger_comment_id IN (
+			SELECT id FROM comment
+			WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+		)
+	`, f.issueID, marker).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE agent_task_queue
+		SET status='running',started_at=now()
+		WHERE id=$1
+	`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE agent_task_queue
+		SET status='completed',completed_at=now()
+		WHERE id=$1
+	`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+
+	recovered := <-firstResult
+	stable := <-secondResult
+	for index, got := range []recoveryResponse{recovered, stable} {
+		if got.err != nil {
+			t.Fatalf("recovery %d failed: %v", index+1, got.err)
+		}
+		if got.status != http.StatusOK {
+			t.Fatalf("recovery %d = %d, want 200", index+1, got.status)
+		}
+	}
+	if recovered.data.CommentID == "" || recovered.data.TaskID == "" ||
+		recovered.data.Task["agent_id"] != f.agentID ||
+		recovered.data.Task["originator_user_id"] != testUserID ||
+		recovered.data.Task["accountable_user_id"] != testUserID {
+		t.Fatalf("recovered continuation attribution mismatch: %#v", recovered.data)
+	}
+	if stable.data.CommentID != recovered.data.CommentID ||
+		stable.data.TaskID != recovered.data.TaskID {
+		t.Fatalf("concurrent replay diverged: recovered=%#v stable=%#v",
+			recovered.data, stable.data)
+	}
+	var persistedTaskID, taskStatus string
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT r.continuation_task_id,t.status
+		FROM strikeflow_connector_content_reply_receipt r
+		JOIN agent_task_queue t ON t.id=r.continuation_task_id
+		WHERE r.issue_id=$1 AND r.idempotency_key=$2
+	`, f.issueID, key).Scan(&persistedTaskID, &taskStatus); err != nil {
+		t.Fatal(err)
+	}
+	if persistedTaskID != recovered.data.TaskID || taskStatus != "completed" {
+		t.Fatalf("persisted terminal continuation mismatch: id=%s status=%s",
+			persistedTaskID, taskStatus)
 	}
 	if err := testPool.QueryRow(t.Context(), `
 		SELECT count(*) FROM agent_task_queue

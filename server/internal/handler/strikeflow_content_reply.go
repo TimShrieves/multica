@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -161,30 +163,53 @@ func (h *Handler) ReplyStrikeFlowContentPackage(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Body fields can only narrow this database authority; they cannot widen it.
-	var bindingOK bool
-	err = tx.QueryRow(r.Context(), `
-		SELECT EXISTS(
-			SELECT 1
-			FROM member m
-			JOIN agent a ON a.id=$3 AND a.workspace_id=m.workspace_id
-			JOIN issue i ON i.id=$4 AND i.workspace_id=m.workspace_id
-			JOIN comment c ON c.id=$5 AND c.issue_id=i.id AND c.workspace_id=i.workspace_id
-			WHERE m.workspace_id=$1 AND m.user_id=$2
-			  AND i.project_id=$6
-			  AND i.assignee_type='agent' AND i.assignee_id=a.id
-			  AND i.status IN ('in_review','in_progress','done')
-			  AND a.archived_at IS NULL
-			  AND c.parent_id IS NULL AND c.author_type='agent' AND c.author_id=a.id
-		)
-	`, scope.WorkspaceID, scope.RecipientID, scope.AgentID,
-		issueID, rootID, projectID).Scan(&bindingOK)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to validate content reply")
+	// Body fields can only narrow database authority; they cannot widen it.
+	// Lock every mutable authorization source in this invariant order:
+	// token -> member -> agent -> issue -> root. Concurrent removal, archive,
+	// reassignment, project move, or root mutation must either wait for this
+	// reply to commit or win first and make the reply fail closed.
+	lockAuthorizedRow := func(query string, args ...any) bool {
+		var locked bool
+		lockErr := tx.QueryRow(r.Context(), query, args...).Scan(&locked)
+		if errors.Is(lockErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "content reply source not found")
+			return false
+		}
+		if lockErr != nil || !locked {
+			writeError(w, http.StatusInternalServerError, "failed to lock content reply source")
+			return false
+		}
+		return true
+	}
+	if !lockAuthorizedRow(`
+		SELECT true FROM member
+		WHERE workspace_id=$1 AND user_id=$2
+		FOR SHARE
+	`, scope.WorkspaceID, scope.RecipientID) {
 		return
 	}
-	if !bindingOK {
-		writeError(w, http.StatusNotFound, "content reply source not found")
+	if !lockAuthorizedRow(`
+		SELECT true FROM agent
+		WHERE id=$1 AND workspace_id=$2 AND archived_at IS NULL
+		FOR SHARE
+	`, scope.AgentID, scope.WorkspaceID) {
+		return
+	}
+	if !lockAuthorizedRow(`
+		SELECT true FROM issue
+		WHERE id=$1 AND workspace_id=$2 AND project_id=$3
+		  AND assignee_type='agent' AND assignee_id=$4
+		  AND status IN ('in_review','in_progress','done')
+		FOR SHARE
+	`, issueID, scope.WorkspaceID, projectID, scope.AgentID) {
+		return
+	}
+	if !lockAuthorizedRow(`
+		SELECT true FROM comment
+		WHERE id=$1 AND issue_id=$2 AND workspace_id=$3
+		  AND parent_id IS NULL AND author_type='agent' AND author_id=$4
+		FOR SHARE
+	`, rootID, issueID, scope.WorkspaceID, scope.AgentID) {
 		return
 	}
 
@@ -299,17 +324,9 @@ func (h *Handler) ReplyStrikeFlowContentPackage(w http.ResponseWriter, r *http.R
 			r.Context(), &parent, scope.WorkspaceID, "member", scope.RecipientID,
 		)
 	}
-	task := h.strikeFlowContentReplyTaskReceipt(r, issueID, comment.ID, scope.AgentID)
-	if task == nil {
-		// Enqueue is intentionally recoverable after the durable comment commit.
-		// A serial replay first queries by the exact trigger; enqueue admission
-		// coalesces or blocks while a matching issue-agent task is active.
-		_ = h.triggerTasksForComment(
-			r.Context(), issue, comment, &parent,
-			"member", scope.RecipientID, scope.RecipientID, "", nil,
-		)
-		task = h.strikeFlowContentReplyTaskReceipt(r, issueID, comment.ID, scope.AgentID)
-	}
+	task := h.recoverStrikeFlowContentReplyContinuation(
+		r, scope, issue, comment, parent, key,
+	)
 	if task == nil {
 		// The durable comment and idempotency receipt are already committed.
 		// A retry replays them and can recover the continuation receipt without
@@ -331,9 +348,18 @@ func (h *Handler) ReplyStrikeFlowContentPackage(w http.ResponseWriter, r *http.R
 	})
 }
 
-func (h *Handler) strikeFlowContentReplyTaskReceipt(r *http.Request, issueID, commentID pgtype.UUID, agentID string) map[string]any {
+type strikeFlowContentReplyRowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func strikeFlowContentReplyTaskReceipt(
+	ctx context.Context,
+	q strikeFlowContentReplyRowQuerier,
+	issueID, commentID pgtype.UUID,
+	agentID string,
+) map[string]any {
 	var id, taskAgentID, triggerID, originatorID, accountableID pgtype.UUID
-	err := h.DB.QueryRow(r.Context(), `
+	err := q.QueryRow(ctx, `
 		SELECT id,agent_id,trigger_comment_id,originator_user_id,accountable_user_id
 		FROM agent_task_queue
 		WHERE issue_id=$1 AND trigger_comment_id=$2 AND agent_id=$3
@@ -351,4 +377,105 @@ func (h *Handler) strikeFlowContentReplyTaskReceipt(r *http.Request, issueID, co
 		"originator_user_id":  uuidToPtr(originatorID),
 		"accountable_user_id": uuidToPtr(accountableID),
 	}
+}
+
+func strikeFlowContentReplyTaskByID(
+	ctx context.Context,
+	q strikeFlowContentReplyRowQuerier,
+	taskID, issueID, commentID pgtype.UUID,
+	agentID string,
+) map[string]any {
+	var id, taskAgentID, triggerID, originatorID, accountableID pgtype.UUID
+	err := q.QueryRow(ctx, `
+		SELECT id,agent_id,trigger_comment_id,originator_user_id,accountable_user_id
+		FROM agent_task_queue
+		WHERE id=$1 AND issue_id=$2 AND trigger_comment_id=$3 AND agent_id=$4
+	`, taskID, issueID, commentID, agentID).Scan(
+		&id, &taskAgentID, &triggerID, &originatorID, &accountableID,
+	)
+	if err != nil {
+		return nil
+	}
+	return map[string]any{
+		"id":                  util.UUIDToString(id),
+		"agent_id":            util.UUIDToString(taskAgentID),
+		"trigger_comment_id":  uuidToPtr(triggerID),
+		"originator_user_id":  uuidToPtr(originatorID),
+		"accountable_user_id": uuidToPtr(accountableID),
+	}
+}
+
+func (h *Handler) recoverStrikeFlowContentReplyContinuation(
+	r *http.Request,
+	scope middleware.StrikeFlowConnectorScope,
+	issue db.Issue,
+	comment db.Comment,
+	parent db.Comment,
+	key pgtype.UUID,
+) map[string]any {
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		return nil
+	}
+	defer tx.Rollback(r.Context())
+
+	// The rotation-stable receipt is the durable continuation mutex. Every
+	// recovery locks this exact row, then either returns its persisted task,
+	// adopts an exact task left by a crash after enqueue, or enqueues once while
+	// all concurrent same-key replays wait.
+	var continuationTaskID pgtype.UUID
+	err = tx.QueryRow(r.Context(), `
+		SELECT continuation_task_id
+		FROM strikeflow_connector_content_reply_receipt
+		WHERE workspace_id=$1 AND recipient_id=$2 AND agent_id=$3
+		  AND idempotency_key=$4 AND issue_id=$5 AND comment_id=$6
+		FOR UPDATE
+	`, scope.WorkspaceID, scope.RecipientID, scope.AgentID, key,
+		issue.ID, comment.ID).Scan(&continuationTaskID)
+	if err != nil {
+		return nil
+	}
+
+	var task map[string]any
+	if continuationTaskID.Valid {
+		task = strikeFlowContentReplyTaskByID(
+			r.Context(), tx, continuationTaskID, issue.ID, comment.ID, scope.AgentID,
+		)
+		if task == nil {
+			return nil
+		}
+	} else {
+		task = strikeFlowContentReplyTaskReceipt(
+			r.Context(), tx, issue.ID, comment.ID, scope.AgentID,
+		)
+		if task == nil {
+			_ = h.triggerTasksForComment(
+				r.Context(), issue, comment, &parent,
+				"member", scope.RecipientID, scope.RecipientID, "", nil,
+			)
+			task = strikeFlowContentReplyTaskReceipt(
+				r.Context(), tx, issue.ID, comment.ID, scope.AgentID,
+			)
+		}
+		if task == nil {
+			return nil
+		}
+		taskID, parseErr := util.ParseUUID(task["id"].(string))
+		if parseErr != nil {
+			return nil
+		}
+		tag, updateErr := tx.Exec(r.Context(), `
+			UPDATE strikeflow_connector_content_reply_receipt
+			SET continuation_task_id=$5
+			WHERE workspace_id=$1 AND recipient_id=$2 AND agent_id=$3
+			  AND idempotency_key=$4 AND continuation_task_id IS NULL
+		`, scope.WorkspaceID, scope.RecipientID, scope.AgentID, key, taskID)
+		if updateErr != nil || tag.RowsAffected() != 1 {
+			return nil
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		return nil
+	}
+	return task
 }

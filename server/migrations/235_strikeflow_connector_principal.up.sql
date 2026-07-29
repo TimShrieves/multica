@@ -103,6 +103,7 @@ CREATE TABLE strikeflow_connector_content_reply_receipt (
     source_revision INTEGER NOT NULL CHECK (source_revision > 0),
     payload_hash TEXT NOT NULL,
     comment_id UUID,
+    continuation_task_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     committed_at TIMESTAMPTZ,
     PRIMARY KEY (workspace_id, recipient_id, agent_id, idempotency_key),
