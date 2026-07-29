@@ -843,6 +843,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Post("/archive", h.ArchiveStrikeFlowInbox)
 			r.Post("/replies", h.ReplyStrikeFlowInbox)
 		})
+		r.Post("/content-replies", h.ReplyStrikeFlowContentPackage)
 	})
 
 	// Protected API routes

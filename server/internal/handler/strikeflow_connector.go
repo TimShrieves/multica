@@ -32,11 +32,13 @@ var strikeFlowAllowedScopes = map[string]struct{}{
 	"inbox:read_receipt": {},
 	"inbox:archive":      {},
 	"inbox:reply":        {},
+	"content:reply":      {},
 }
 
 type createStrikeFlowConnectorTokenRequest struct {
 	Name        string   `json:"name"`
 	RecipientID string   `json:"recipient_id"`
+	AgentID     string   `json:"agent_id,omitempty"`
 	ProjectIDs  []string `json:"project_ids"`
 	Scopes      []string `json:"scopes"`
 	ExpiresAt   string   `json:"expires_at"`
@@ -48,6 +50,7 @@ type strikeFlowConnectorTokenResponse struct {
 	Token       string   `json:"token,omitempty"`
 	TokenPrefix string   `json:"token_prefix"`
 	RecipientID string   `json:"recipient_id"`
+	AgentID     string   `json:"agent_id,omitempty"`
 	ProjectIDs  []string `json:"project_ids"`
 	Scopes      []string `json:"scopes"`
 	ExpiresAt   string   `json:"expires_at"`
@@ -81,6 +84,15 @@ func validateStrikeFlowTokenRequest(w http.ResponseWriter, req createStrikeFlowC
 	}
 	if len(seenScopes) != len(req.Scopes) {
 		writeError(w, http.StatusBadRequest, "duplicate connector scope")
+		return nil, time.Time{}, false
+	}
+	_, contentReply := seenScopes["content:reply"]
+	if contentReply && (len(seenScopes) != 1 || len(req.ProjectIDs) != 1 || strings.TrimSpace(req.AgentID) == "") {
+		writeError(w, http.StatusBadRequest, "content reply credentials require one project, one bound agent, and cannot combine scopes")
+		return nil, time.Time{}, false
+	}
+	if !contentReply && strings.TrimSpace(req.AgentID) != "" {
+		writeError(w, http.StatusBadRequest, "agent_id is only valid for content reply credentials")
 		return nil, time.Time{}, false
 	}
 	projectIDs := make([]pgtype.UUID, 0, len(req.ProjectIDs))
@@ -139,6 +151,20 @@ func (h *Handler) CreateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "recipient is not a workspace member")
 		return
 	}
+	var agentID pgtype.UUID
+	if strings.TrimSpace(req.AgentID) != "" {
+		parsed, ok := parseUUIDOrBadRequest(w, req.AgentID, "agent id")
+		if !ok {
+			return
+		}
+		if err := h.DB.QueryRow(r.Context(),
+			`SELECT id FROM agent WHERE id=$1 AND workspace_id=$2 AND archived_at IS NULL`,
+			parsed, workspaceID,
+		).Scan(&agentID); err != nil {
+			writeError(w, http.StatusBadRequest, "agent is not active in the workspace")
+			return
+		}
+	}
 	var projectCount int
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT count(*) FROM project WHERE workspace_id=$1 AND id=ANY($2::uuid[])`,
@@ -156,10 +182,10 @@ func (h *Handler) CreateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 	var id pgtype.UUID
 	err = h.DB.QueryRow(r.Context(), `
 		INSERT INTO strikeflow_connector_token
-			(workspace_id, recipient_id, name, token_hash, token_prefix, project_ids, scopes, expires_at, created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			(workspace_id, recipient_id, agent_id, name, token_hash, token_prefix, project_ids, scopes, expires_at, created_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id
-	`, workspaceID, recipientID, strings.TrimSpace(req.Name), auth.HashToken(plain),
+	`, workspaceID, recipientID, agentID, strings.TrimSpace(req.Name), auth.HashToken(plain),
 		prefix, projectIDs, req.Scopes, expiresAt, creatorID).Scan(&id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create connector token")
@@ -168,7 +194,7 @@ func (h *Handler) CreateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusCreated, strikeFlowConnectorTokenResponse{
 		ID: util.UUIDToString(id), Name: strings.TrimSpace(req.Name), Token: plain,
 		TokenPrefix: prefix, RecipientID: req.RecipientID, ProjectIDs: req.ProjectIDs,
-		Scopes: req.Scopes, ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+		AgentID: req.AgentID, Scopes: req.Scopes, ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -230,7 +256,7 @@ func (h *Handler) RotateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 		return
 	}
 	defer tx.Rollback(r.Context())
-	var newID, recipientID pgtype.UUID
+	var newID, recipientID, agentID pgtype.UUID
 	var name string
 	var projects []pgtype.UUID
 	var scopes []string
@@ -241,11 +267,11 @@ func (h *Handler) RotateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 			RETURNING *
 		)
 		INSERT INTO strikeflow_connector_token
-			(workspace_id,recipient_id,name,token_hash,token_prefix,project_ids,scopes,expires_at,rotated_from_id,created_by)
-		SELECT workspace_id,recipient_id,name,$3,$4,project_ids,scopes,$5,id,$6 FROM old
-		RETURNING id,recipient_id,name,project_ids,scopes
+			(workspace_id,recipient_id,agent_id,name,token_hash,token_prefix,project_ids,scopes,expires_at,rotated_from_id,created_by)
+		SELECT workspace_id,recipient_id,agent_id,name,$3,$4,project_ids,scopes,$5,id,$6 FROM old
+		RETURNING id,recipient_id,agent_id,name,project_ids,scopes
 	`, tokenID, workspaceID, auth.HashToken(plain), plain[:8], expiresAt, creatorID).
-		Scan(&newID, &recipientID, &name, &projects, &scopes)
+		Scan(&newID, &recipientID, &agentID, &name, &projects, &scopes)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "active connector token not found")
 		return
@@ -261,7 +287,7 @@ func (h *Handler) RotateStrikeFlowConnectorToken(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusCreated, strikeFlowConnectorTokenResponse{
 		ID: util.UUIDToString(newID), Name: name, Token: plain, TokenPrefix: plain[:8],
 		RecipientID: util.UUIDToString(recipientID), ProjectIDs: projectStrings,
-		Scopes: scopes, ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+		AgentID: uuidToString(agentID), Scopes: scopes, ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -330,11 +356,11 @@ func auditStrikeFlowConnector(exec strikeFlowAuditExecutor, r *http.Request, sco
 	_, err := exec.Exec(r.Context(), `
 		INSERT INTO strikeflow_connector_audit
 			(token_id,workspace_id,recipient_id,request_id,action,outcome,
-			 inbox_item_id,issue_id,comment_id,idempotency_key,payload_hash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			 inbox_item_id,issue_id,root_comment_id,comment_id,idempotency_key,payload_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		`, scope.TokenID, scope.WorkspaceID, scope.RecipientID,
 		chimw.GetReqID(r.Context()), action, outcome,
-		item.ItemID, item.IssueID, commentID, key, nullIfEmpty(hash))
+		item.ItemID, item.IssueID, item.RootCommentID, commentID, key, nullIfEmpty(hash))
 	return err
 }
 
@@ -625,7 +651,8 @@ func validStrikeFlowReply(message string) bool {
 	lower := strings.ToLower(message)
 	return !strings.Contains(lower, "mention://") &&
 		!strings.Contains(lower, "[strikeflow-agent-inbox:") &&
-		!strings.Contains(lower, "[strikeflow-feedback:")
+		!strings.Contains(lower, "[strikeflow-feedback:") &&
+		!strings.Contains(lower, "[strikeflow-content-reply:")
 }
 
 func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {

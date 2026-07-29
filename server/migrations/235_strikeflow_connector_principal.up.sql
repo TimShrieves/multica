@@ -4,13 +4,17 @@ CREATE TABLE strikeflow_connector_token (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
     recipient_id UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+    agent_id UUID REFERENCES agent(id) ON DELETE RESTRICT,
     name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
     token_hash TEXT NOT NULL UNIQUE,
     token_prefix TEXT NOT NULL,
     project_ids UUID[] NOT NULL CHECK (cardinality(project_ids) BETWEEN 1 AND 32),
     scopes TEXT[] NOT NULL CHECK (
         cardinality(scopes) BETWEEN 1 AND 4
-        AND scopes <@ ARRAY['inbox:read','inbox:read_receipt','inbox:archive','inbox:reply']::text[]
+        AND scopes <@ ARRAY[
+            'inbox:read','inbox:read_receipt','inbox:archive','inbox:reply',
+            'content:reply'
+        ]::text[]
     ),
     expires_at TIMESTAMPTZ NOT NULL,
     last_used_at TIMESTAMPTZ,
@@ -18,6 +22,13 @@ CREATE TABLE strikeflow_connector_token (
     rotated_from_id UUID REFERENCES strikeflow_connector_token(id) ON DELETE SET NULL,
     created_by UUID NOT NULL REFERENCES "user"(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        ('content:reply' = ANY(scopes)
+            AND cardinality(scopes) = 1
+            AND cardinality(project_ids) = 1
+            AND agent_id IS NOT NULL)
+        OR (NOT ('content:reply' = ANY(scopes)) AND agent_id IS NULL)
+    ),
     CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
 );
 
@@ -37,6 +48,7 @@ CREATE TABLE strikeflow_connector_audit (
     outcome TEXT NOT NULL CHECK (outcome IN ('allowed','denied','replayed','failed')),
     inbox_item_id UUID,
     issue_id UUID,
+    root_comment_id UUID,
     comment_id UUID,
     idempotency_key UUID,
     payload_hash TEXT,
@@ -71,4 +83,34 @@ CREATE TABLE strikeflow_connector_reply_receipt (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     committed_at TIMESTAMPTZ,
     PRIMARY KEY (token_id, idempotency_key)
+);
+
+-- Content-package replies use the immutable package binding's issue/root pair.
+-- These UUIDs intentionally have no foreign keys: the receipt is forensic and
+-- must survive token rotation/revocation or later source cleanup. The handler
+-- revalidates every live relationship in the same transaction before mutation.
+CREATE TABLE strikeflow_connector_content_reply_receipt (
+    token_id UUID NOT NULL,
+    workspace_id UUID NOT NULL,
+    recipient_id UUID NOT NULL,
+    agent_id UUID NOT NULL,
+    idempotency_key UUID NOT NULL,
+    issue_id UUID NOT NULL,
+    root_comment_id UUID NOT NULL,
+    reply_root_hash TEXT NOT NULL,
+    package_id UUID NOT NULL,
+    package_payload_hash TEXT NOT NULL,
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    payload_hash TEXT NOT NULL,
+    comment_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    committed_at TIMESTAMPTZ,
+    PRIMARY KEY (workspace_id, recipient_id, agent_id, idempotency_key),
+    CHECK (length(reply_root_hash) = 64),
+    CHECK (length(package_payload_hash) = 64),
+    CHECK (length(payload_hash) = 64),
+    CHECK (
+        (comment_id IS NULL AND committed_at IS NULL)
+        OR (comment_id IS NOT NULL AND committed_at IS NOT NULL)
+    )
 );

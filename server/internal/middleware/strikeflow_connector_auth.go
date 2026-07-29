@@ -23,6 +23,7 @@ type StrikeFlowConnectorScope struct {
 	TokenID     string
 	WorkspaceID string
 	RecipientID string
+	AgentID     string
 	Projects    map[string]struct{}
 	Scopes      map[string]struct{}
 	ExpiresAt   time.Time
@@ -57,16 +58,16 @@ func StrikeFlowConnectorAuth(pool *pgxpool.Pool) func(http.Handler) http.Handler
 				return
 			}
 
-			var tokenID, workspaceID, recipientID pgtype.UUID
+			var tokenID, workspaceID, recipientID, agentID pgtype.UUID
 			var projects []pgtype.UUID
 			var permissions []string
 			var expiresAt time.Time
 			err := pool.QueryRow(r.Context(), `
-				SELECT id, workspace_id, recipient_id, project_ids, scopes, expires_at
+				SELECT id, workspace_id, recipient_id, agent_id, project_ids, scopes, expires_at
 				FROM strikeflow_connector_token
 				WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
 			`, auth.HashToken(raw)).Scan(
-				&tokenID, &workspaceID, &recipientID, &projects, &permissions, &expiresAt,
+				&tokenID, &workspaceID, &recipientID, &agentID, &projects, &permissions, &expiresAt,
 			)
 			if err != nil {
 				slog.Warn("strikeflow connector auth rejected", "path", r.URL.Path)
@@ -78,6 +79,7 @@ func StrikeFlowConnectorAuth(pool *pgxpool.Pool) func(http.Handler) http.Handler
 				TokenID:     util.UUIDToString(tokenID),
 				WorkspaceID: util.UUIDToString(workspaceID),
 				RecipientID: util.UUIDToString(recipientID),
+				AgentID:     util.UUIDToString(agentID),
 				Projects:    make(map[string]struct{}, len(projects)),
 				Scopes:      make(map[string]struct{}, len(permissions)),
 				ExpiresAt:   expiresAt,

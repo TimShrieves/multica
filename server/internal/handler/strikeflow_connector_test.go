@@ -17,6 +17,7 @@ func TestValidStrikeFlowReplyFailsClosed(t *testing.T) {
 		"mention://agent/00000000-0000-0000-0000-000000000000",
 		"[strikeflow-agent-inbox:00000000-0000-0000-0000-000000000000]",
 		"[STRIKEFLOW-FEEDBACK:00000000-0000-0000-0000-000000000000]",
+		"[strikeflow-content-reply:00000000-0000-4000-8000-000000000000]",
 		"nul\x00hidden",
 		strings.Repeat("x", strikeFlowReplyMaxBytes+1),
 	} {

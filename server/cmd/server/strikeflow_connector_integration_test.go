@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -19,20 +21,22 @@ import (
 type strikeFlowIntegrationFixture struct {
 	projectID, otherProjectID string
 	issueID, rootID, itemID   string
+	agentID, contentTokenID   string
 	valid, wrongProject       string
 	wrongRecipient            string
 	expired, revoked          string
 	readOnly                  string
+	contentReply              string
 }
 
 func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture {
 	t.Helper()
 	ctx := t.Context()
 	var f strikeFlowIntegrationFixture
-	var agentID, runtimeID string
+	var runtimeID string
 	if err := testPool.QueryRow(ctx,
 		`SELECT id,runtime_id FROM agent WHERE workspace_id=$1 ORDER BY created_at LIMIT 1`,
-		testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		testWorkspaceID).Scan(&f.agentID, &runtimeID); err != nil {
 		t.Fatal(err)
 	}
 	for _, target := range []*string{&f.projectID, &f.otherProjectID} {
@@ -48,13 +52,13 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 		VALUES($1,'Scoped inbox integration','done','none','agent',$2,'member',$3,0,$4,
 			COALESCE((SELECT max(number)+1 FROM issue WHERE workspace_id=$1),1))
 		RETURNING id
-	`, testWorkspaceID, agentID, testUserID, f.projectID).Scan(&f.issueID); err != nil {
+	`, testWorkspaceID, f.agentID, testUserID, f.projectID).Scan(&f.issueID); err != nil {
 		t.Fatal(err)
 	}
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type)
 		VALUES($1,$2,'agent',$3,'Review requested','comment') RETURNING id
-	`, f.issueID, testWorkspaceID, agentID).Scan(&f.rootID); err != nil {
+	`, f.issueID, testWorkspaceID, f.agentID).Scan(&f.rootID); err != nil {
 		t.Fatal(err)
 	}
 	var sourceTaskID string
@@ -65,7 +69,7 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 			completed_at
 		) VALUES($1,$2,$3,'completed',ARRAY[$4]::uuid[],$5,$5,'direct_human','comment',$4,now())
 		RETURNING id
-	`, agentID, runtimeID, f.issueID, f.rootID, testUserID).Scan(&sourceTaskID); err != nil {
+	`, f.agentID, runtimeID, f.issueID, f.rootID, testUserID).Scan(&sourceTaskID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE comment SET source_task_id=$1 WHERE id=$2`, sourceTaskID, f.rootID); err != nil {
@@ -78,7 +82,7 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 		VALUES($1,'member',$2,'agent_action_required','action_required',$3,
 			'Review requested','Please review','agent',$4,$5)
 		RETURNING id
-	`, testWorkspaceID, testUserID, f.issueID, agentID, details).Scan(&f.itemID); err != nil {
+	`, testWorkspaceID, testUserID, f.issueID, f.agentID, details).Scan(&f.itemID); err != nil {
 		t.Fatal(err)
 	}
 	var otherUserID string
@@ -119,7 +123,41 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 	f.expired = insertToken("expired", testUserID, []string{f.projectID}, allScopes, now.Add(-2*time.Hour), now.Add(-time.Hour), false)
 	f.revoked = insertToken("revoked", testUserID, []string{f.projectID}, allScopes, now, now.Add(24*time.Hour), true)
 	f.readOnly = insertToken("readonly", testUserID, []string{f.projectID}, []string{"inbox:read"}, now, now.Add(24*time.Hour), false)
+	f.contentReply = "msc_content_" + f.itemID + "_integration"
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO strikeflow_connector_token(
+			workspace_id,recipient_id,agent_id,name,token_hash,token_prefix,project_ids,
+			scopes,created_at,expires_at,created_by
+		) VALUES($1,$2,$3,'content reply',$4,'msc_test',$5,
+			ARRAY['content:reply']::text[],$6,$7,$2)
+		RETURNING id
+	`, testWorkspaceID, testUserID, f.agentID, auth.HashToken(f.contentReply),
+		[]string{f.projectID}, now, now.Add(24*time.Hour)).Scan(&f.contentTokenID); err != nil {
+		t.Fatal(err)
+	}
 	return f
+}
+
+func strikeFlowTestRootHash(rootID string) string {
+	raw, _ := json.Marshal(map[string]string{"reply_root_id": rootID})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func strikeFlowContentReplyBody(f strikeFlowIntegrationFixture, key, message string) map[string]any {
+	return map[string]any{
+		"workspace_id":         testWorkspaceID,
+		"recipient_id":         testUserID,
+		"project_id":           f.projectID,
+		"source_issue_id":      f.issueID,
+		"reply_root_id":        f.rootID,
+		"reply_root_hash":      strikeFlowTestRootHash(f.rootID),
+		"package_id":           "00000000-0000-4000-8000-000000000123",
+		"package_payload_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"source_revision":      1,
+		"idempotency_key":      key,
+		"message":              message,
+	}
 }
 
 func strikeFlowRequest(t *testing.T, token, method, path string, body any) *http.Response {
@@ -248,6 +286,184 @@ func TestStrikeFlowConnectorCredentialRoutesRequireHumanActor(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestStrikeFlowContentReplyCredentialIsPurposeScoped(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO strikeflow_connector_token(
+			workspace_id,recipient_id,agent_id,name,token_hash,token_prefix,
+			project_ids,scopes,expires_at,created_by
+		) VALUES($1,$2,$3,'invalid mixed content scope',$4,'msc_test',$5,
+			ARRAY['content:reply']::text[],now()+interval '1 day',$2)
+	`, testWorkspaceID, testUserID, f.agentID,
+		auth.HashToken("msc_invalid_multi_project_"+f.itemID),
+		[]string{f.projectID, f.otherProjectID}); err == nil {
+		t.Fatal("database accepted a content credential with multiple projects")
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO strikeflow_connector_content_reply_receipt(
+			token_id,workspace_id,recipient_id,agent_id,idempotency_key,issue_id,
+			root_comment_id,reply_root_hash,package_id,package_payload_hash,
+			source_revision,payload_hash
+		) VALUES($1,$2,$3,$4,'00000000-0000-4000-8000-000000000093',$5,$6,
+			'bad','00000000-0000-4000-8000-000000000123',
+			'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+	`, f.contentTokenID, testWorkspaceID, testUserID, f.agentID,
+		f.issueID, f.rootID); err == nil {
+		t.Fatal("database accepted a malformed forensic receipt hash")
+	}
+	base := "/api/workspaces/" + testWorkspaceID + "/strikeflow-connector-tokens"
+	valid := map[string]any{
+		"name": "content package replies", "recipient_id": testUserID,
+		"agent_id": f.agentID, "project_ids": []string{f.projectID},
+		"scopes":     []string{"content:reply"},
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"mixed_scope": func(body map[string]any) {
+			body["scopes"] = []string{"content:reply", "inbox:read"}
+		},
+		"multiple_projects": func(body map[string]any) {
+			body["project_ids"] = []string{f.projectID, f.otherProjectID}
+		},
+		"missing_agent": func(body map[string]any) {
+			delete(body, "agent_id")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := make(map[string]any, len(valid))
+			for key, value := range valid {
+				body[key] = value
+			}
+			mutate(body)
+			resp := strikeFlowRequest(t, testToken, http.MethodPost, base, body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("purpose-scope violation = %d, want 400", resp.StatusCode)
+			}
+			resp.Body.Close()
+		})
+	}
+	resp := strikeFlowRequest(t, testToken, http.MethodPost, base, valid)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("valid content credential = %d, want 201", resp.StatusCode)
+	}
+	var created struct {
+		ID      string `json:"id"`
+		AgentID string `json:"agent_id"`
+	}
+	readJSON(t, resp, &created)
+	if created.ID == "" || created.AgentID != f.agentID {
+		t.Fatalf("content credential binding mismatch: %#v", created)
+	}
+	resp = strikeFlowRequest(t, testToken, http.MethodDelete, base+"/"+created.ID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("content credential revoke = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestStrikeFlowContentReplyScopeBindingReplayAndRotation(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	path := "/api/integrations/strikeflow/content-replies"
+	key := "00000000-0000-4000-8000-000000000095"
+	body := strikeFlowContentReplyBody(f, key, "Please revise the package opening.")
+
+	resp := strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("inbox credential reached content reply = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodGet, "/api/integrations/strikeflow/inbox", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("content credential reached inbox = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first content reply = %d, want 201", resp.StatusCode)
+	}
+	var first struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			CommentID string         `json:"comment_id"`
+			TaskID    string         `json:"task_id"`
+			Task      map[string]any `json:"task"`
+		} `json:"data"`
+	}
+	readJSON(t, resp, &first)
+	if !first.OK || first.Data.CommentID == "" || first.Data.TaskID == "" ||
+		first.Data.Task["agent_id"] != f.agentID {
+		t.Fatalf("content reply receipt mismatch: %#v", first)
+	}
+
+	rotatePath := "/api/workspaces/" + testWorkspaceID +
+		"/strikeflow-connector-tokens/" + f.contentTokenID + "/rotate"
+	resp = strikeFlowRequest(t, testToken, http.MethodPost, rotatePath, map[string]any{
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("content credential rotate = %d, want 201", resp.StatusCode)
+	}
+	var rotated struct {
+		ID      string `json:"id"`
+		Token   string `json:"token"`
+		AgentID string `json:"agent_id"`
+	}
+	readJSON(t, resp, &rotated)
+	if rotated.ID == "" || rotated.Token == "" || rotated.AgentID != f.agentID {
+		t.Fatal("rotation did not preserve content agent binding")
+	}
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("rotated credential remained valid = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = strikeFlowRequest(t, rotated.Token, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotation-stable replay = %d, want 200", resp.StatusCode)
+	}
+	var replay struct {
+		Data struct {
+			CommentID string `json:"comment_id"`
+			TaskID    string `json:"task_id"`
+		} `json:"data"`
+	}
+	readJSON(t, resp, &replay)
+	if replay.Data.CommentID != first.Data.CommentID || replay.Data.TaskID != first.Data.TaskID {
+		t.Fatalf("rotation replay diverged: first=%#v replay=%#v", first.Data, replay.Data)
+	}
+
+	conflict := strikeFlowContentReplyBody(f, key, "Different payload.")
+	resp = strikeFlowRequest(t, rotated.Token, http.MethodPost, path, conflict)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("divergent replay = %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+	badMarker := strikeFlowContentReplyBody(
+		f, "00000000-0000-4000-8000-000000000094",
+		"[strikeflow-content-reply:00000000-0000-4000-8000-000000000001]",
+	)
+	resp = strikeFlowRequest(t, rotated.Token, http.MethodPost, path, badMarker)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("reserved marker injection = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = strikeFlowRequest(t, testToken, http.MethodDelete,
+		"/api/workspaces/"+testWorkspaceID+"/strikeflow-connector-tokens/"+rotated.ID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("rotated credential revoke = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = strikeFlowRequest(t, rotated.Token, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked credential remained valid = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {
 	f := seedStrikeFlowIntegrationFixture(t)
 	if _, err := testPool.Exec(t.Context(), `
@@ -300,6 +516,31 @@ func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {
 	}
 	if comments != 0 || receipts != 0 {
 		t.Fatalf("audit failure persisted reply state: comments=%d receipts=%d", comments, receipts)
+	}
+
+	contentKey := "00000000-0000-4000-8000-000000000096"
+	resp = strikeFlowRequest(t, f.contentReply, http.MethodPost,
+		"/api/integrations/strikeflow/content-replies",
+		strikeFlowContentReplyBody(f, contentKey, "Audit must commit with this package reply."))
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("content reply audit failure = %d, want 500", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var contentComments, contentReceipts int
+	contentMarker := "[strikeflow-content-reply:" + contentKey + "]"
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM comment WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'`,
+		f.issueID, contentMarker).Scan(&contentComments); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM strikeflow_connector_content_reply_receipt WHERE idempotency_key=$1`,
+		contentKey).Scan(&contentReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if contentComments != 0 || contentReceipts != 0 {
+		t.Fatalf("audit failure persisted content reply: comments=%d receipts=%d",
+			contentComments, contentReceipts)
 	}
 
 	dropConstraint()
