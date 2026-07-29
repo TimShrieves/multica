@@ -332,6 +332,13 @@ func TestExecOpenclawCLITimeoutIsNotMisdiagnosedAsMissingInterpreter(t *testing.
 	if err != nil {
 		t.Skipf("no sleep binary available to build a hanging shim: %v", err)
 	}
+	// `sleep` is a grandchild of the shim, and CommandContext kills only the
+	// direct child. Verified on linux/dash: without a WaitDelay backstop this
+	// call ran for the shim's FULL duration despite a 150ms deadline (5.01s for
+	// a 5s sleep), because cmd.Output() blocks in Wait() until the inherited
+	// stdout pipe closes; with openclawCLIWaitDelay it returns in ~2.2s. macOS
+	// does not reproduce it either way, which is why CI caught this and local
+	// runs did not.
 	shim := writeShim(t, t.TempDir(), "#!/bin/sh\n"+sleepBin+" 30\n", "")
 	pathWithout(t) // an interpreter lookup, if reached, would report "missing"
 
@@ -342,7 +349,12 @@ func TestExecOpenclawCLITimeoutIsNotMisdiagnosedAsMissingInterpreter(t *testing.
 	if err == nil {
 		t.Fatal("expected the timed-out invocation to fail")
 	}
-	if elapsed := time.Since(start); elapsed > 20*time.Second {
+	// The bound also proves openclawCLIWaitDelay is doing its job. `sh` runs
+	// `sleep` as a grandchild that inherits stdout; CommandContext kills only
+	// the direct child, and cmd.Output() blocks in Wait() until the stdout pipe
+	// closes. Without a WaitDelay backstop this call parked for the shim's full
+	// 30s despite a 150ms deadline — CI caught exactly that.
+	if elapsed := time.Since(start); elapsed > openclawCLIWaitDelay+5*time.Second {
 		t.Fatalf("invocation did not honour the context deadline (took %s)", elapsed)
 	}
 	msg := err.Error()

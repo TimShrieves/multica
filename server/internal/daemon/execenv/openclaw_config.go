@@ -33,6 +33,17 @@ const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 // node start without letting a hung CLI stall task dispatch indefinitely.
 const openclawCLITimeout = 5 * time.Second
 
+// openclawCLIWaitDelay bounds how long execOpenclawCLI waits after
+// openclawCLITimeout fires before forcing the child's pipes shut and reaping it.
+//
+// Without this the timeout above is not actually enforceable. CommandContext
+// kills only the direct child, and `cmd.Output()` blocks in Wait() until the
+// stdout pipe closes — so any surviving grandchild that inherited stdout keeps
+// the call parked long past 5s. An npm shim is exactly that shape on Windows
+// (cmd.exe → node), so a wedged node would stall task dispatch indefinitely.
+// Mirrors the same backstop detectCLIVersion uses for the `--version` probe.
+const openclawCLIWaitDelay = 2 * time.Second
+
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
 // is meaningful in production — Timeout is here for tests that need a tight
 // cap to assert error paths.
@@ -775,6 +786,9 @@ var openclawExec = execOpenclawCLI
 func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = os.Environ()
+	// See openclawCLIWaitDelay: without this the context timeout above cannot
+	// actually bound this call when the CLI leaves a grandchild holding stdout.
+	cmd.WaitDelay = openclawCLIWaitDelay
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	raw, err := cmd.Output()
