@@ -320,16 +320,25 @@ func TestExecOpenclawCLIAnnotatesSilentShimFailure(t *testing.T) {
 // CLI was reported as "node is not resolvable, install Node.js", pointing the
 // user at something that was never broken.
 func TestExecOpenclawCLITimeoutIsNotMisdiagnosedAsMissingInterpreter(t *testing.T) {
-	shim := writeShim(t, t.TempDir(),
-		"#!/bin/sh\nsleep 30\n",
-		"@echo off\r\nping -n 30 127.0.0.1 >NUL\r\n",
-	)
+	if runtime.GOOS == "windows" {
+		t.Skip("covered by TestWindowsOpenclawShimTimeoutIsNotMisdiagnosed with a real cmd.exe host")
+	}
+	// Resolve the blocking helper BEFORE PATH is stripped and embed it by
+	// absolute path. The shim has to keep running with an empty PATH, so it
+	// cannot rely on a PATH lookup of its own: `sh` on macOS quietly falls back
+	// to a default PATH, but dash on Linux does not, which made a PATH-relative
+	// `sleep` pass locally and fail in CI with "sleep: not found".
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("no sleep binary available to build a hanging shim: %v", err)
+	}
+	shim := writeShim(t, t.TempDir(), "#!/bin/sh\n"+sleepBin+" 30\n", "")
 	pathWithout(t) // an interpreter lookup, if reached, would report "missing"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := execOpenclawCLI(ctx, shim, "config", "file")
+	_, err = execOpenclawCLI(ctx, shim, "config", "file")
 	if err == nil {
 		t.Fatal("expected the timed-out invocation to fail")
 	}
