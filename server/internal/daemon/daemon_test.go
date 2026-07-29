@@ -2390,14 +2390,19 @@ func TestShouldRetryWithFreshSession_CompatPathIsBackendScoped(t *testing.T) {
 	})
 }
 
-// TestShouldRetryWithFreshSession_UnresumableHistoryIsBackendAgnostic is the
-// cross-backend contract for GH #6066 / GH #5760. Multica holds only an opaque
-// session id and cannot know which of its backends will write a truncated
-// transcript, so the recovery must not be a property of the adapter that
-// happened to get a bug report. Every supported backend gets the same verdict
-// on the same provider error — including the ones that report rejections
-// (ResumeRejected is false here for all of them: nothing rejected the resume,
-// the transcript loaded and the provider refused to replay it).
+// TestShouldRetryWithFreshSession_UnresumableHistoryIsBackendAgnostic pins the
+// DECISION layer for GH #6066 / GH #5760: given the same provider error, every
+// supported backend gets the same verdict, so recovery is not a property of
+// whichever adapter happened to get a bug report. ResumeRejected is false for
+// all of them here — nothing rejected the resume; the transcript loaded and the
+// provider refused to replay it.
+//
+// Scope, deliberately: this feeds each backend a hand-built agent.Result, so it
+// proves the shared decision ignores the provider NAME. It does not prove all
+// 17 adapters surface an upstream error into Result.Error in the first place —
+// #5760 is the counter-example, where the Kimi/ACP adapter swallowed the error
+// and reported completed. The fix therefore covers every backend that surfaces
+// the error; adapter-level surfacing is tracked separately (#5785 for ACP).
 //
 // The safety half is asserted in the same loop: tools > 0 must still veto the
 // retry for every backend, because re-running a turn that already posted a

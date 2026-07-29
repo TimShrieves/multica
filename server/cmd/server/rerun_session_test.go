@@ -156,7 +156,6 @@ func TestGetLastTaskSessionFallsBackWhenLatestSessionBlanked(t *testing.T) {
 	}
 }
 
-// TestCompletedTaskRolloutMissingWithholdsAndDisclosesGap is the cross-layer
 // TestGetLastTaskSessionExcludesEmptyHistoryMessage is the SQL half of the
 // GH #6066 fix. The daemon now classifies an empty-message rejection as
 // api_invalid_request, but daemons upgrade on their own cadence — a self-host
@@ -228,6 +227,7 @@ func TestGetLastTaskSessionKeepsToolEmptinessError(t *testing.T) {
 	}
 }
 
+// TestCompletedTaskRolloutMissingWithholdsAndDisclosesGap is the cross-layer
 // regression for MUL-5305 Must-fix 1: a COMPLETED follow-up whose Codex rollout
 // is missing (the #5934 case — the user waits for each turn to finish) must (1)
 // NOT be handed to the next follow-up as its resume pointer, and (2) NOT be
