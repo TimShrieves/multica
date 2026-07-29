@@ -2796,6 +2796,8 @@ WHERE (
       AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow')
       AND NOT (COALESCE(error, '') ILIKE '%400%' AND COALESCE(error, '') ILIKE '%invalid_request_error%')
       AND NOT (COALESCE(error, '') ILIKE '%image dimensions exceed max allowed size%' AND COALESCE(error, '') ILIKE '%image.source.base64.data%')
+      AND NOT (COALESCE(error, '') ~* 'must not be empty|must be non-?empty|must have non-?empty|non-?empty content|cannot be empty|should not be empty'
+               AND COALESCE(error, '') ~* 'role[^a-z0-9]{0,2}assistant|assistant message|message at position|messages\.[0-9]|messages\[[0-9]')
     )
   )
 ORDER BY terminal_at DESC
@@ -2876,6 +2878,16 @@ type GetLastTaskSessionRow struct {
 // resuming the poisoned session. Both markers are required so the clause stays
 // exactly as narrow as classifyPoisonedError and the Kiro detector — an
 // unrelated error that only mentions image dimensions is NOT excluded.
+//
+// The final pair of regexes is the provider-agnostic version of the same
+// guard, and it matters most for self-hosted installs: daemons upgrade on
+// their own cadence, so a host still running a daemon without
+// taskfailure.UnresumableHistory reports an empty-message rejection as
+// agent_error.unknown and would otherwise keep resuming the transcript the
+// provider just refused (GH #6066). Both regexes must match — an emptiness
+// complaint AND a locator pointing into the message history — mirroring
+// emptyContentRe and historyMessageLocatorRe in pkg/taskfailure/resume.go.
+// Keep the three in sync.
 func (q *Queries) GetLastTaskSession(ctx context.Context, arg GetLastTaskSessionParams) (GetLastTaskSessionRow, error) {
 	row := q.db.QueryRow(ctx, getLastTaskSession, arg.AgentID, arg.IssueID)
 	var i GetLastTaskSessionRow

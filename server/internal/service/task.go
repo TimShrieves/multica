@@ -3412,7 +3412,14 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 		return true
 	}
 	lower := strings.ToLower(errorText)
-	return strings.Contains(lower, "400") && strings.Contains(lower, "invalid_request_error")
+	if strings.Contains(lower, "400") && strings.Contains(lower, "invalid_request_error") {
+		return true
+	}
+	// Same defense-in-depth for the provider-agnostic empty-message shape:
+	// a daemon too old to carry classifyPoisonedError's new branch reports
+	// agent_error.unknown, and without this the manual-retry path would
+	// happily resume the transcript the provider just refused (GH #6066).
+	return taskfailure.UnresumableHistory(errorText)
 }
 
 // retryEligible reports whether a failed task qualifies for an automatic retry

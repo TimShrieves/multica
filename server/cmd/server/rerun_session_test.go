@@ -157,6 +157,77 @@ func TestGetLastTaskSessionFallsBackWhenLatestSessionBlanked(t *testing.T) {
 }
 
 // TestCompletedTaskRolloutMissingWithholdsAndDisclosesGap is the cross-layer
+// TestGetLastTaskSessionExcludesEmptyHistoryMessage is the SQL half of the
+// GH #6066 fix. The daemon now classifies an empty-message rejection as
+// api_invalid_request, but daemons upgrade on their own cadence — a self-host
+// install still running an older one writes agent_error.unknown, and only the
+// query's text guard keeps the next task off the poisoned session. This drives
+// that exact row shape.
+func TestGetLastTaskSessionExcludesEmptyHistoryMessage(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+
+	issueID, agentID, runtimeID := setupRerunTestFixture(t)
+	t.Cleanup(func() { cleanupRerunFixture(t, issueID) })
+
+	ctx := context.Background()
+
+	// The row an un-upgraded daemon writes for GH #6066: the reason is the
+	// catchall, so the failure_reason blacklist does not fire.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, started_at, completed_at, session_id, work_dir, failure_reason, error)
+		VALUES ($1, $2, $3, 'failed', 0, now() - interval '1 minute', now() - interval '1 minute', 'POISONED-EMPTY-MSG', '/tmp/poisoned', 'agent_error.unknown',
+		        'Invalid request: the message at position 37 with role ''assistant'' must not be empty')
+	`, agentID, runtimeID, issueID); err != nil {
+		t.Fatalf("insert poisoned task: %v", err)
+	}
+
+	queries := db.New(testPool)
+	prior, err := queries.GetLastTaskSession(ctx, db.GetLastTaskSessionParams{
+		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
+		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
+	})
+	if err == nil && prior.SessionID.Valid {
+		t.Fatalf("expected the empty-message session to be excluded, got %q", prior.SessionID.String)
+	}
+}
+
+// TestGetLastTaskSessionKeepsToolEmptinessError is the narrowness half: the
+// text guard must not swallow a healthy session because some tool complained
+// that a field was empty. A false positive here silently drops conversation
+// context on every follow-up, which is worse than the bug it guards against.
+func TestGetLastTaskSessionKeepsToolEmptinessError(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+
+	issueID, agentID, runtimeID := setupRerunTestFixture(t)
+	t.Cleanup(func() { cleanupRerunFixture(t, issueID) })
+
+	ctx := context.Background()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, started_at, completed_at, session_id, work_dir, failure_reason, error)
+		VALUES ($1, $2, $3, 'failed', 0, now() - interval '1 minute', now() - interval '1 minute', 'HEALTHY-SESSION', '/tmp/healthy', 'agent_error.unknown',
+		        'validation error: field must not be empty')
+	`, agentID, runtimeID, issueID); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+
+	queries := db.New(testPool)
+	prior, err := queries.GetLastTaskSession(ctx, db.GetLastTaskSessionParams{
+		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
+		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("GetLastTaskSession failed: %v", err)
+	}
+	if !prior.SessionID.Valid || prior.SessionID.String != "HEALTHY-SESSION" {
+		t.Fatalf("a tool emptiness error must not retire the session, got %+v", prior.SessionID)
+	}
+}
+
 // regression for MUL-5305 Must-fix 1: a COMPLETED follow-up whose Codex rollout
 // is missing (the #5934 case — the user waits for each turn to finish) must (1)
 // NOT be handed to the next follow-up as its resume pointer, and (2) NOT be
