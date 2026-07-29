@@ -831,6 +831,20 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
+	// Purpose-built StrikeFlow service surface. The msc_ credential is not a
+	// user PAT and can never enter the generic protected route tree below.
+	r.Route("/api/integrations/strikeflow", func(r chi.Router) {
+		r.Use(middleware.StrikeFlowConnectorAuth(pool))
+		r.Get("/inbox", h.ListStrikeFlowInbox)
+		r.Route("/inbox/{itemId}", func(r chi.Router) {
+			r.Get("/issue", h.GetStrikeFlowInboxIssue)
+			r.Get("/thread", h.ListStrikeFlowInboxThread)
+			r.Post("/read", h.MarkStrikeFlowInboxRead)
+			r.Post("/archive", h.ArchiveStrikeFlowInbox)
+			r.Post("/replies", h.ReplyStrikeFlowInbox)
+		})
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
@@ -917,6 +931,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					r.Post("/strikeflow-connector-tokens", h.CreateStrikeFlowConnectorToken)
+					r.Post("/strikeflow-connector-tokens/{tokenId}/rotate", h.RotateStrikeFlowConnectorToken)
+					r.Delete("/strikeflow-connector-tokens/{tokenId}", h.RevokeStrikeFlowConnectorToken)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
