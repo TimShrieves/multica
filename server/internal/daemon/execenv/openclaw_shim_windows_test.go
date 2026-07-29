@@ -4,6 +4,7 @@ package execenv
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -186,19 +187,24 @@ func TestWindowsOpenclawShimColocatedNodeIsCredited(t *testing.T) {
 }
 
 // TestWindowsOpenclawShimTimeoutIsNotMisdiagnosed is must-fix 1 on Windows: a
-// hung shim killed by the context deadline must not be reported as a missing
+// slow shim killed by the context deadline must not be reported as a missing
 // interpreter. Go surfaces the kill as *exec.ExitError, so only the explicit
 // context check keeps this correct.
+//
+// The shim waits only briefly: execOpenclawCLI sets no WaitDelay, so
+// cmd.Output() stays parked until the descendant closes stdout. A long wait
+// would make the test hostage to it and leave a live process behind.
 func TestWindowsOpenclawShimTimeoutIsNotMisdiagnosed(t *testing.T) {
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "openclaw.cmd")
-	body := "@ECHO off\r\nping -n 30 127.0.0.1 >NUL\r\n"
+	// ~2s: ping sends 3 packets one second apart.
+	body := "@ECHO off\r\nping -n 3 127.0.0.1 >NUL\r\n"
 	if err := os.WriteFile(shim, []byte(body), 0o644); err != nil {
 		t.Fatalf("write shim: %v", err)
 	}
 	t.Setenv("PATH", systemPath(t))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	_, err := execOpenclawCLI(ctx, shim, "config", "file")
 	if err == nil {
@@ -206,8 +212,8 @@ func TestWindowsOpenclawShimTimeoutIsNotMisdiagnosed(t *testing.T) {
 	}
 	msg := err.Error()
 	t.Logf("observed error: %s", msg)
-	if !strings.Contains(msg, context.DeadlineExceeded.Error()) {
-		t.Errorf("error should attribute the deadline\ngot: %s", msg)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) must hold\ngot: %s", msg)
 	}
 	for _, forbidden := range []string{"install Node.js", "resolves neither", "the interpreter is reachable"} {
 		if strings.Contains(msg, forbidden) {

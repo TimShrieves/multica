@@ -31,18 +31,24 @@ const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 // openclawCLITimeout caps each `openclaw config ...` invocation during task
 // setup. The CLI is fast (<200ms normal); 5s leaves headroom for a cold
 // node start without letting a hung CLI stall task dispatch indefinitely.
-const openclawCLITimeout = 5 * time.Second
-
-// openclawCLIWaitDelay bounds how long execOpenclawCLI waits after
-// openclawCLITimeout fires before forcing the child's pipes shut and reaping it.
 //
-// Without this the timeout above is not actually enforceable. CommandContext
-// kills only the direct child, and `cmd.Output()` blocks in Wait() until the
-// stdout pipe closes — so any surviving grandchild that inherited stdout keeps
-// the call parked long past 5s. An npm shim is exactly that shape on Windows
-// (cmd.exe → node), so a wedged node would stall task dispatch indefinitely.
-// Mirrors the same backstop detectCLIVersion uses for the `--version` probe.
-const openclawCLIWaitDelay = 2 * time.Second
+// Known gap (deliberately not fixed here): this deadline does not actually
+// bound the call when the CLI leaves a descendant holding stdout.
+// CommandContext kills only the direct child, and cmd.Output() blocks in
+// Wait() until the stdout pipe closes, so the call runs for the descendant's
+// lifetime. Measured on linux/dash: a shim whose backgrounded child slept 6s
+// took 6.01s against a 150ms deadline. An npm shim is that shape on Windows
+// (cmd.exe → node).
+//
+// A cmd.WaitDelay backstop bounds the call but leaves the descendant running
+// (measured: returns in 2.17s with the grandchild still in state S), trading a
+// hang for a process leak — and on Unix nothing reaps it, because
+// preparationProcessController.finish() is a no-op there. Closing this properly
+// needs process-tree ownership (Unix process group, Windows Job Object) so the
+// deadline can terminate the whole tree, which is its own change with its own
+// risk surface. Tracked separately; this file intentionally keeps the existing
+// behaviour rather than shipping half of it.
+const openclawCLITimeout = 5 * time.Second
 
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
 // is meaningful in production — Timeout is here for tests that need a tight
@@ -783,12 +789,14 @@ var openclawExec = execOpenclawCLI
 // context is checked FIRST; otherwise a timeout gets reported as "node is not
 // on PATH, install Node.js", sending the user to fix something that was never
 // broken.
+//
+// In that branch the CONTEXT error is what gets %w-wrapped, not the process
+// error, so errors.Is(err, context.DeadlineExceeded) holds for callers that
+// check cancellation the standard way. The process error is still printed for
+// diagnosis, just not as the wrapped cause.
 func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = os.Environ()
-	// See openclawCLIWaitDelay: without this the context timeout above cannot
-	// actually bound this call when the CLI leaves a grandchild holding stdout.
-	cmd.WaitDelay = openclawCLIWaitDelay
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	raw, err := cmd.Output()
@@ -796,9 +804,9 @@ func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, e
 		stderrMsg := strings.TrimSpace(stderr.String())
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if stderrMsg != "" {
-				return "", fmt.Errorf("openclaw %s: %w (%v; stderr: %s)", strings.Join(args, " "), err, ctxErr, stderrMsg)
+				return "", fmt.Errorf("openclaw %s: %w (process: %v; stderr: %s)", strings.Join(args, " "), ctxErr, err, stderrMsg)
 			}
-			return "", fmt.Errorf("openclaw %s: %w (%v)", strings.Join(args, " "), err, ctxErr)
+			return "", fmt.Errorf("openclaw %s: %w (process: %v)", strings.Join(args, " "), ctxErr, err)
 		}
 		if stderrMsg != "" {
 			return "", fmt.Errorf("openclaw %s: %w (stderr: %s)", strings.Join(args, " "), err, stderrMsg)

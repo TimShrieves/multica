@@ -319,6 +319,12 @@ func TestExecOpenclawCLIAnnotatesSilentShimFailure(t *testing.T) {
 // genuine exit 1 produces. Without checking the context first, a slow or hung
 // CLI was reported as "node is not resolvable, install Node.js", pointing the
 // user at something that was never broken.
+//
+// The shim sleeps only briefly on purpose. execOpenclawCLI sets no WaitDelay
+// (see openclawCLITimeout's note on why that is left alone), so cmd.Output()
+// stays parked until the descendant closes stdout — a long sleep here would
+// make the test hostage to it AND leave a live process behind. A short sleep
+// keeps the assertion about attribution, which is what this test is for.
 func TestExecOpenclawCLITimeoutIsNotMisdiagnosedAsMissingInterpreter(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("covered by TestWindowsOpenclawShimTimeoutIsNotMisdiagnosed with a real cmd.exe host")
@@ -330,42 +336,58 @@ func TestExecOpenclawCLITimeoutIsNotMisdiagnosedAsMissingInterpreter(t *testing.
 	// `sleep` pass locally and fail in CI with "sleep: not found".
 	sleepBin, err := exec.LookPath("sleep")
 	if err != nil {
-		t.Skipf("no sleep binary available to build a hanging shim: %v", err)
+		t.Skipf("no sleep binary available to build a slow shim: %v", err)
 	}
-	// `sleep` is a grandchild of the shim, and CommandContext kills only the
-	// direct child. Verified on linux/dash: without a WaitDelay backstop this
-	// call ran for the shim's FULL duration despite a 150ms deadline (5.01s for
-	// a 5s sleep), because cmd.Output() blocks in Wait() until the inherited
-	// stdout pipe closes; with openclawCLIWaitDelay it returns in ~2.2s. macOS
-	// does not reproduce it either way, which is why CI caught this and local
-	// runs did not.
-	shim := writeShim(t, t.TempDir(), "#!/bin/sh\n"+sleepBin+" 30\n", "")
+	shim := writeShim(t, t.TempDir(), "#!/bin/sh\n"+sleepBin+" 1\n", "")
 	pathWithout(t) // an interpreter lookup, if reached, would report "missing"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	start := time.Now()
 	_, err = execOpenclawCLI(ctx, shim, "config", "file")
 	if err == nil {
 		t.Fatal("expected the timed-out invocation to fail")
 	}
-	// The bound also proves openclawCLIWaitDelay is doing its job. `sh` runs
-	// `sleep` as a grandchild that inherits stdout; CommandContext kills only
-	// the direct child, and cmd.Output() blocks in Wait() until the stdout pipe
-	// closes. Without a WaitDelay backstop this call parked for the shim's full
-	// 30s despite a 150ms deadline — CI caught exactly that.
-	if elapsed := time.Since(start); elapsed > openclawCLIWaitDelay+5*time.Second {
-		t.Fatalf("invocation did not honour the context deadline (took %s)", elapsed)
-	}
 	msg := err.Error()
 	t.Logf("timeout error: %s", msg)
-	if !strings.Contains(msg, context.DeadlineExceeded.Error()) {
-		t.Errorf("error should attribute the deadline\ngot: %s", msg)
+
+	// The nit from round 2: the context error must be the wrapped cause, so
+	// standard cancellation checks work instead of only string matching.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) must hold\ngot: %s", msg)
 	}
 	for _, forbidden := range []string{"install Node.js", "resolves neither", "the interpreter is reachable"} {
 		if strings.Contains(msg, forbidden) {
 			t.Errorf("timeout must not be diagnosed as an interpreter problem (found %q)\ngot: %s", forbidden, msg)
 		}
+	}
+}
+
+// TestExecOpenclawCLICancellationIsWrapped pins the same cancellation contract
+// for an explicitly cancelled context, not just a deadline, so a caller can
+// distinguish "we gave up" from "the CLI failed" without parsing strings.
+func TestExecOpenclawCLICancellationIsWrapped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim shape is covered by the windows-tagged tests")
+	}
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("no sleep binary available to build a slow shim: %v", err)
+	}
+	shim := writeShim(t, t.TempDir(), "#!/bin/sh\n"+sleepBin+" 1\n", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	_, err = execOpenclawCLI(ctx, shim, "config", "file")
+	if err == nil {
+		t.Fatal("expected the cancelled invocation to fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) must hold\ngot: %s", err)
 	}
 }
 
