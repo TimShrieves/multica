@@ -62,9 +62,7 @@ func TestGetLastChatTaskSessionDoesNotResurrectFromOlderCompletedRow(t *testing.
 
 	queries := db.New(testPool)
 	prior, err := queries.GetLastChatTaskSession(ctx, pgtype.UUID{Bytes: parseUUIDBytes(chatSessionID), Valid: true})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("poisoned chat session resurrected from older completed row: %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastChatTaskSessionKeepsHealthyDistinctSession is the narrowness
@@ -138,9 +136,7 @@ func TestRetiredSessionExcludedFromIssueResume(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("a retired session must never be re-selected, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestRetiredSessionExcludedFromChatResume is the chat mirror of the above.
@@ -168,9 +164,7 @@ func TestRetiredSessionExcludedFromChatResume(t *testing.T) {
 
 	queries := db.New(testPool)
 	prior, err := queries.GetLastChatTaskSession(ctx, pgtype.UUID{Bytes: parseUUIDBytes(chatSessionID), Valid: true})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("a retired chat session must never be re-selected, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestFailTaskClearsPoisonedChatPointer covers the bypass that made the chat

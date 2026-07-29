@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
@@ -12,6 +14,25 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// requireSessionExcluded asserts a resume lookup found nothing BECAUSE the
+// session was excluded — not because the query itself blew up.
+//
+// The bare `if err == nil && prior.SessionID.Valid` form these tests shared is
+// false-green: any real fault (undefined column, syntax error, dead
+// connection) makes err non-nil, the condition false, and the test pass. Run
+// against a database missing this PR's new column, the exclusion tests
+// reported PASS on a SQLSTATE 42703. Requiring pgx.ErrNoRows specifically is
+// what makes a passing test mean "the filter worked".
+func requireSessionExcluded(t *testing.T, sessionID pgtype.Text, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected the session to be excluded, but the lookup returned %q", sessionID.String)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("lookup failed for an unrelated reason, so this test proves nothing: %v", err)
+	}
+}
 
 // setupRerunTestFixture creates an issue assigned to the integration test
 // agent and returns (issueID, agentID, runtimeID).
@@ -187,9 +208,7 @@ func TestGetLastTaskSessionExcludesEmptyHistoryMessage(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected the empty-message session to be excluded, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionKeepsToolEmptinessError is the narrowness half: the
@@ -387,9 +406,7 @@ func TestGetLastTaskSessionFallbackPoisonedClassifier(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected no resumable session, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionExcludesAPIInvalidRequest covers the MUL-1921
@@ -420,9 +437,7 @@ func TestGetLastTaskSessionExcludesAPIInvalidRequest(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected no resumable session for api_invalid_request, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionExcludesCodexSemanticInactivity covers Codex
@@ -604,9 +619,7 @@ func TestGetLastTaskSessionExcludesLegacyAPI400(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected no resumable session, but query fell back to %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionKeepsBenignAgentErrorWithSession asserts the
@@ -926,7 +939,6 @@ func TestEnqueueTaskForIssueDoesNotForceFreshSession(t *testing.T) {
 	}
 }
 
-
 // TestGetLastTaskSessionExcludesPoisonedOriginSession is the GH #5975 core
 // regression: the SAME session_id appears on an older 'completed' row (the turn
 // that first baked the oversized image into history) AND a newer poisoned
@@ -968,9 +980,7 @@ func TestGetLastTaskSessionExcludesPoisonedOriginSession(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected the poisoned session to be fully invalidated, but query returned %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionFallsBackToHealthyDistinctSession asserts that while a
@@ -1047,9 +1057,7 @@ func TestGetLastTaskSessionExcludesKiroOversizedImageByText(t *testing.T) {
 		AgentID: pgtype.UUID{Bytes: parseUUIDBytes(agentID), Valid: true},
 		IssueID: pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true},
 	})
-	if err == nil && prior.SessionID.Valid {
-		t.Fatalf("expected the oversized-image session to be filtered by text, got %q", prior.SessionID.String)
-	}
+	requireSessionExcluded(t, prior.SessionID, err)
 }
 
 // TestGetLastTaskSessionRestoresRecoveredSession asserts the per-session-latest
@@ -1092,7 +1100,6 @@ func TestGetLastTaskSessionRestoresRecoveredSession(t *testing.T) {
 		t.Fatalf("expected the recovered session to be resumable again, got %q", prior.SessionID.String)
 	}
 }
-
 
 // TestGetLastTaskSessionKeepsDimensionPhraseWithoutImageMarker is the
 // review-tightening negative control: the oversized-image ILIKE now requires
