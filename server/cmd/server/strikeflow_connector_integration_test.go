@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/realtime"
 )
 
 type strikeFlowIntegrationFixture struct {
@@ -119,13 +123,17 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 }
 
 func strikeFlowRequest(t *testing.T, token, method, path string, body any) *http.Response {
+	return strikeFlowRequestAt(t, testServer.URL, token, method, path, body)
+}
+
+func strikeFlowRequestAt(t *testing.T, serverURL, token, method, path string, body any) *http.Response {
 	t.Helper()
 	var reader io.Reader
 	if body != nil {
 		raw, _ := json.Marshal(body)
 		reader = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, testServer.URL+path, reader)
+	req, err := http.NewRequest(method, serverURL+path, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +144,171 @@ func strikeFlowRequest(t *testing.T, token, method, path string, body any) *http
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func TestStrikeFlowConnectorCredentialRoutesRequireHumanActor(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	base := "/api/workspaces/" + testWorkspaceID + "/strikeflow-connector-tokens"
+	createBody := map[string]any{
+		"name": "single-item activation test", "recipient_id": testUserID,
+		"project_ids": []string{f.projectID},
+		"scopes":      []string{"inbox:read", "inbox:read_receipt", "inbox:archive", "inbox:reply"},
+		"expires_at":  time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+
+	resp := strikeFlowRequest(t, testToken, http.MethodPost, base, createBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("human create = %d, want 201", resp.StatusCode)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	readJSON(t, resp, &created)
+	if created.ID == "" {
+		t.Fatal("human create returned no token id")
+	}
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT id,runtime_id FROM agent WHERE workspace_id=$1 ORDER BY created_at LIMIT 1`,
+		testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := testPool.QueryRow(t.Context(), `
+		INSERT INTO agent_task_queue(agent_id,runtime_id,status,priority)
+		VALUES($1,$2,'queued',0) RETURNING id
+	`, agentID, runtimeID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	taskToken := "mat_strikeflow_credential_guard_" + f.itemID
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO task_token(token_hash,task_id,agent_id,workspace_id,user_id,expires_at)
+		VALUES($1,$2,$3,$4,$5,now()+interval '1 hour')
+	`, auth.HashToken(taskToken), taskID, agentID, testWorkspaceID, testUserID); err != nil {
+		t.Fatal(err)
+	}
+
+	fleet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/pat/verify" {
+			t.Errorf("unexpected fleet request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"valid":true,"owner_id":"`+testUserID+`","instance_id":"test","instance_record_id":"test"}`)
+	}))
+	defer fleet.Close()
+	t.Setenv("MULTICA_CLOUD_FLEET_URL", fleet.URL)
+	hub := realtime.NewHub()
+	go hub.Run()
+	bus := events.New()
+	registerListeners(bus, hub)
+	cloudServer := httptest.NewServer(NewRouter(testPool, hub, bus, analytics.NoopClient{}, nil))
+	defer cloudServer.Close()
+
+	machineActors := []struct {
+		name, serverURL, token string
+	}{
+		{name: "task_token", serverURL: testServer.URL, token: taskToken},
+		{name: "cloud_pat", serverURL: cloudServer.URL, token: "mcn_strikeflow_credential_guard"},
+	}
+	rotateBody := map[string]any{
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	for _, actor := range machineActors {
+		t.Run(actor.name, func(t *testing.T) {
+			for _, request := range []struct {
+				method, path string
+				body         any
+			}{
+				{method: http.MethodPost, path: base, body: createBody},
+				{method: http.MethodPost, path: base + "/" + created.ID + "/rotate", body: rotateBody},
+				{method: http.MethodDelete, path: base + "/" + created.ID},
+			} {
+				resp := strikeFlowRequestAt(t, actor.serverURL, actor.token, request.method, request.path, request.body)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("%s %s = %d, want 403", request.method, request.path, resp.StatusCode)
+				}
+				resp.Body.Close()
+			}
+		})
+	}
+
+	resp = strikeFlowRequest(t, testToken, http.MethodPost, base+"/"+created.ID+"/rotate", rotateBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("human rotate = %d, want 201", resp.StatusCode)
+	}
+	var rotated struct {
+		ID string `json:"id"`
+	}
+	readJSON(t, resp, &rotated)
+	resp = strikeFlowRequest(t, testToken, http.MethodDelete, base+"/"+rotated.ID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("human revoke = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	if _, err := testPool.Exec(t.Context(), `
+		ALTER TABLE strikeflow_connector_audit
+		ADD CONSTRAINT strikeflow_test_reject_audit CHECK (false) NOT VALID
+	`); err != nil {
+		t.Fatal(err)
+	}
+	dropConstraint := func() {
+		_, _ = testPool.Exec(context.Background(), `
+			ALTER TABLE strikeflow_connector_audit
+			DROP CONSTRAINT IF EXISTS strikeflow_test_reject_audit
+		`)
+	}
+	t.Cleanup(dropConstraint)
+
+	base := "/api/integrations/strikeflow/inbox/" + f.itemID
+	for _, suffix := range []string{"/read", "/archive"} {
+		resp := strikeFlowRequest(t, f.valid, http.MethodPost, base+suffix, nil)
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("%s audit failure = %d, want 500", suffix, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	var read, archived bool
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT read,archived FROM inbox_item WHERE id=$1`, f.itemID).
+		Scan(&read, &archived); err != nil || read || archived {
+		t.Fatalf("audit failure persisted inbox mutation: read=%v archived=%v err=%v", read, archived, err)
+	}
+
+	key := "00000000-0000-4000-8000-000000000097"
+	resp := strikeFlowRequest(t, f.valid, http.MethodPost, base+"/replies",
+		map[string]any{"idempotency_key": key, "message": "Audit must commit with this reply."})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("reply audit failure = %d, want 500", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var comments, receipts int
+	marker := "[strikeflow-agent-inbox:" + key + "]"
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM comment WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'`,
+		f.issueID, marker).Scan(&comments); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM strikeflow_connector_reply_receipt WHERE idempotency_key=$1`,
+		key).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if comments != 0 || receipts != 0 {
+		t.Fatalf("audit failure persisted reply state: comments=%d receipts=%d", comments, receipts)
+	}
+
+	dropConstraint()
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, base+"/replies",
+		map[string]any{"idempotency_key": key, "message": "Audit must commit with this reply."})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry after audit recovery = %d, want 201", resp.StatusCode)
+	}
+	resp.Body.Close()
 }
 
 func TestStrikeFlowConnectorSecurityBoundary(t *testing.T) {

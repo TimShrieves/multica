@@ -985,9 +985,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
-					r.Post("/strikeflow-connector-tokens", h.CreateStrikeFlowConnectorToken)
-					r.Post("/strikeflow-connector-tokens/{tokenId}/rotate", h.RotateStrikeFlowConnectorToken)
-					r.Delete("/strikeflow-connector-tokens/{tokenId}", h.RevokeStrikeFlowConnectorToken)
+					r.With(handler.RequireHumanActor).Post("/strikeflow-connector-tokens", h.CreateStrikeFlowConnectorToken)
+					r.With(handler.RequireHumanActor).Post("/strikeflow-connector-tokens/{tokenId}/rotate", h.RotateStrikeFlowConnectorToken)
+					r.With(handler.RequireHumanActor).Delete("/strikeflow-connector-tokens/{tokenId}", h.RevokeStrikeFlowConnectorToken)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/middleware"
@@ -320,15 +322,20 @@ func (h *Handler) loadStrikeFlowBoundItem(w http.ResponseWriter, r *http.Request
 	return item, true
 }
 
-func (h *Handler) auditStrikeFlowConnector(r *http.Request, scope middleware.StrikeFlowConnectorScope, action, outcome string, item strikeFlowBoundItem, commentID pgtype.UUID, key pgtype.UUID, hash string) {
-	_, _ = h.DB.Exec(r.Context(), `
+type strikeFlowAuditExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func auditStrikeFlowConnector(exec strikeFlowAuditExecutor, r *http.Request, scope middleware.StrikeFlowConnectorScope, action, outcome string, item strikeFlowBoundItem, commentID pgtype.UUID, key pgtype.UUID, hash string) error {
+	_, err := exec.Exec(r.Context(), `
 		INSERT INTO strikeflow_connector_audit
 			(token_id,workspace_id,recipient_id,request_id,action,outcome,
 			 inbox_item_id,issue_id,comment_id,idempotency_key,payload_hash)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-	`, scope.TokenID, scope.WorkspaceID, scope.RecipientID,
+		`, scope.TokenID, scope.WorkspaceID, scope.RecipientID,
 		chimw.GetReqID(r.Context()), action, outcome,
 		item.ItemID, item.IssueID, commentID, key, nullIfEmpty(hash))
+	return err
 }
 
 func nullIfEmpty(value string) any {
@@ -385,7 +392,14 @@ func (h *Handler) ListStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 			"issue_status": status, "project_id": util.UUIDToString(projectID),
 		})
 	}
-	h.auditStrikeFlowConnector(r, scope, "inbox.list", "allowed", strikeFlowBoundItem{}, pgtype.UUID{}, pgtype.UUID{}, "")
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list connector inbox")
+		return
+	}
+	if err := auditStrikeFlowConnector(h.DB, r, scope, "inbox.list", "allowed", strikeFlowBoundItem{}, pgtype.UUID{}, pgtype.UUID{}, ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to audit connector request")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": result})
 }
 
@@ -413,7 +427,6 @@ func (h *Handler) GetStrikeFlowInboxIssue(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, "issue not found")
 		return
 	}
-	h.auditStrikeFlowConnector(r, scope, "issue.read", "allowed", item, pgtype.UUID{}, pgtype.UUID{}, "")
 	identifier := fmt.Sprintf("%s-%d", h.getIssuePrefix(r.Context(), issue.WorkspaceID), issue.Number)
 	var rootAuthorType string
 	var rootAuthorID, rootSourceTaskID pgtype.UUID
@@ -428,6 +441,10 @@ func (h *Handler) GetStrikeFlowInboxIssue(w http.ResponseWriter, r *http.Request
 	tasks, working, err := h.strikeFlowTaskEvidence(r, item.IssueID, item.RootCommentID, rootSourceTaskID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load connector task evidence")
+		return
+	}
+	if err := auditStrikeFlowConnector(h.DB, r, scope, "issue.read", "allowed", item, pgtype.UUID{}, pgtype.UUID{}, ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to audit connector request")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -536,7 +553,14 @@ func (h *Handler) ListStrikeFlowInboxThread(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusConflict, "connector thread exceeds limit")
 		return
 	}
-	h.auditStrikeFlowConnector(r, scope, "thread.read", "allowed", item, pgtype.UUID{}, pgtype.UUID{}, "")
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list connector thread")
+		return
+	}
+	if err := auditStrikeFlowConnector(h.DB, r, scope, "thread.read", "allowed", item, pgtype.UUID{}, pgtype.UUID{}, ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to audit connector request")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"comments": result, "root_comment_id": util.UUIDToString(item.RootCommentID)})
 }
 
@@ -557,21 +581,34 @@ func (h *Handler) mutateStrikeFlowInbox(w http.ResponseWriter, r *http.Request, 
 	if !ok {
 		return
 	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start connector mutation")
+		return
+	}
+	defer tx.Rollback(r.Context())
 	if action == "read" {
-		if _, err := h.DB.Exec(r.Context(), `UPDATE inbox_item SET read=true WHERE id=$1`, item.ItemID); err != nil {
+		if _, err := tx.Exec(r.Context(), `UPDATE inbox_item SET read=true WHERE id=$1`, item.ItemID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to mark connector item read")
 			return
 		}
 	} else {
-		if _, err := h.DB.Exec(r.Context(), `
-			UPDATE inbox_item SET archived=true
-			WHERE workspace_id=$1 AND recipient_type='member' AND recipient_id=$2 AND issue_id=$3
-		`, scope.WorkspaceID, scope.RecipientID, item.IssueID); err != nil {
+		if _, err := tx.Exec(r.Context(), `
+				UPDATE inbox_item SET archived=true
+				WHERE workspace_id=$1 AND recipient_type='member' AND recipient_id=$2 AND issue_id=$3
+			`, scope.WorkspaceID, scope.RecipientID, item.IssueID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to archive connector item")
 			return
 		}
 	}
-	h.auditStrikeFlowConnector(r, scope, "inbox."+action, "allowed", item, pgtype.UUID{}, pgtype.UUID{}, "")
+	if err := auditStrikeFlowConnector(tx, r, scope, "inbox."+action, "allowed", item, pgtype.UUID{}, pgtype.UUID{}, ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to audit connector mutation")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit connector mutation")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -620,10 +657,17 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	}, "\x00")
 	sum := sha256.Sum256([]byte(hashInput))
 	payloadHash := hex.EncodeToString(sum[:])
-	tag, err := h.DB.Exec(r.Context(), `
-		INSERT INTO strikeflow_connector_reply_receipt
-			(token_id,idempotency_key,inbox_item_id,issue_id,root_comment_id,payload_hash)
-		VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start connector reply")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	tag, err := tx.Exec(r.Context(), `
+			INSERT INTO strikeflow_connector_reply_receipt
+				(token_id,idempotency_key,inbox_item_id,issue_id,root_comment_id,payload_hash)
+			VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING
 	`, scope.TokenID, key, item.ItemID, item.IssueID, item.RootCommentID, payloadHash)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to reserve connector reply")
@@ -632,10 +676,10 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	var storedHash string
 	var storedItemID, storedIssueID, storedRootID, commentID pgtype.UUID
 	var createdAt time.Time
-	if err := h.DB.QueryRow(r.Context(), `
-		SELECT inbox_item_id,issue_id,root_comment_id,payload_hash,comment_id,created_at
-		FROM strikeflow_connector_reply_receipt
-		WHERE token_id=$1 AND idempotency_key=$2
+	if err := tx.QueryRow(r.Context(), `
+			SELECT inbox_item_id,issue_id,root_comment_id,payload_hash,comment_id,created_at
+			FROM strikeflow_connector_reply_receipt
+			WHERE token_id=$1 AND idempotency_key=$2
 	`, scope.TokenID, key).Scan(
 		&storedItemID, &storedIssueID, &storedRootID, &storedHash, &commentID, &createdAt,
 	); err != nil ||
@@ -647,9 +691,16 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if commentID.Valid {
+		if err := auditStrikeFlowConnector(tx, r, scope, "inbox.reply", "replayed", item, commentID, key, payloadHash); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to audit connector reply")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to commit connector reply")
+			return
+		}
 		taskID := h.strikeFlowReplyTaskID(r, item.IssueID, commentID)
 		taskReceipt := h.strikeFlowReplyTaskReceipt(r, item.IssueID, commentID)
-		h.auditStrikeFlowConnector(r, scope, "inbox.reply", "replayed", item, commentID, key, payloadHash)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"comment_id": util.UUIDToString(commentID), "task_id": taskID,
 			"task": taskReceipt, "replayed": true,
@@ -660,28 +711,39 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		// A concurrent caller owns the fresh reservation. After one minute a
 		// crashed owner can be recovered, but first find the durable marker.
 		marker := "[strikeflow-agent-inbox:" + req.IdempotencyKey + "]"
-		err = h.DB.QueryRow(r.Context(), `
-			SELECT id FROM comment WHERE issue_id=$1 AND parent_id=$2 AND content LIKE '%' || $3 || '%'
-			ORDER BY created_at LIMIT 1
-		`, item.IssueID, item.RootCommentID, marker).Scan(&commentID)
+		err = tx.QueryRow(r.Context(), `
+				SELECT id FROM comment WHERE issue_id=$1 AND parent_id=$2 AND content LIKE '%' || $3 || '%'
+				ORDER BY created_at LIMIT 1
+			`, item.IssueID, item.RootCommentID, marker).Scan(&commentID)
 		if err == nil {
-			_, _ = h.DB.Exec(r.Context(), `
-				UPDATE strikeflow_connector_reply_receipt SET comment_id=$3,committed_at=now()
-				WHERE token_id=$1 AND idempotency_key=$2
-			`, scope.TokenID, key, commentID)
+			receiptTag, updateErr := tx.Exec(r.Context(), `
+					UPDATE strikeflow_connector_reply_receipt SET comment_id=$3,committed_at=now()
+					WHERE token_id=$1 AND idempotency_key=$2
+				`, scope.TokenID, key, commentID)
+			if updateErr != nil || receiptTag.RowsAffected() != 1 {
+				writeError(w, http.StatusInternalServerError, "failed to recover connector reply")
+				return
+			}
+			if err := auditStrikeFlowConnector(tx, r, scope, "inbox.reply", "replayed", item, commentID, key, payloadHash); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to audit connector reply")
+				return
+			}
+			if err := tx.Commit(r.Context()); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to commit connector reply")
+				return
+			}
 			taskID := h.strikeFlowReplyTaskID(r, item.IssueID, commentID)
 			taskReceipt := h.strikeFlowReplyTaskReceipt(r, item.IssueID, commentID)
-			h.auditStrikeFlowConnector(r, scope, "inbox.reply", "replayed", item, commentID, key, payloadHash)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"comment_id": util.UUIDToString(commentID), "task_id": taskID,
 				"task": taskReceipt, "replayed": true,
 			})
 			return
 		}
-		claim, claimErr := h.DB.Exec(r.Context(), `
-			UPDATE strikeflow_connector_reply_receipt SET created_at=now()
-			WHERE token_id=$1 AND idempotency_key=$2 AND comment_id IS NULL
-			  AND created_at < now()-interval '1 minute'
+		claim, claimErr := tx.Exec(r.Context(), `
+				UPDATE strikeflow_connector_reply_receipt SET created_at=now()
+				WHERE token_id=$1 AND idempotency_key=$2 AND comment_id IS NULL
+				  AND created_at < now()-interval '1 minute'
 		`, scope.TokenID, key)
 		if claimErr != nil || claim.RowsAffected() != 1 {
 			writeError(w, http.StatusConflict, "connector reply is already in progress")
@@ -689,27 +751,42 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	issue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+	issue, err := qtx.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
 		ID: item.IssueID, WorkspaceID: parseUUID(scope.WorkspaceID),
 	})
 	if err != nil {
 		writeError(w, http.StatusNotFound, "issue not found")
 		return
 	}
-	parent, err := h.Queries.GetComment(r.Context(), item.RootCommentID)
+	parent, err := qtx.GetComment(r.Context(), item.RootCommentID)
 	if err != nil {
 		writeError(w, http.StatusConflict, "authoritative root not found")
 		return
 	}
 	body := "Tim reply via StrikeFlow\n[strikeflow-agent-inbox:" + req.IdempotencyKey + "]\n\n" + message
-	comment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
+	comment, err := qtx.CreateComment(r.Context(), db.CreateCommentParams{
 		IssueID: issue.ID, WorkspaceID: issue.WorkspaceID, AuthorType: "member",
 		AuthorID: parseUUID(scope.RecipientID), Content: body, Type: "comment",
 		ParentID: item.RootCommentID,
 	})
 	if err != nil {
-		h.auditStrikeFlowConnector(r, scope, "inbox.reply", "failed", item, pgtype.UUID{}, key, payloadHash)
 		writeError(w, http.StatusInternalServerError, "failed to create connector reply")
+		return
+	}
+	receiptTag, err := tx.Exec(r.Context(), `
+			UPDATE strikeflow_connector_reply_receipt SET comment_id=$3,committed_at=now()
+			WHERE token_id=$1 AND idempotency_key=$2 AND comment_id IS NULL
+		`, scope.TokenID, key, comment.ID)
+	if err != nil || receiptTag.RowsAffected() != 1 {
+		writeError(w, http.StatusInternalServerError, "failed to commit connector reply receipt")
+		return
+	}
+	if err := auditStrikeFlowConnector(tx, r, scope, "inbox.reply", "allowed", item, comment.ID, key, payloadHash); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to audit connector reply")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit connector reply")
 		return
 	}
 	resp := commentToResponse(comment, nil, nil)
@@ -720,11 +797,6 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	h.TaskService.AutoUnresolveThreadOnReply(r.Context(), &parent, scope.WorkspaceID, "member", scope.RecipientID)
 	resp.TriggerOutcomes = h.triggerTasksForComment(r.Context(), issue, comment, &parent,
 		"member", scope.RecipientID, scope.RecipientID, "", nil)
-	_, _ = h.DB.Exec(r.Context(), `
-		UPDATE strikeflow_connector_reply_receipt SET comment_id=$3,committed_at=now()
-		WHERE token_id=$1 AND idempotency_key=$2
-	`, scope.TokenID, key, comment.ID)
-	h.auditStrikeFlowConnector(r, scope, "inbox.reply", "allowed", item, comment.ID, key, payloadHash)
 	taskID := h.strikeFlowReplyTaskID(r, item.IssueID, comment.ID)
 	taskReceipt := h.strikeFlowReplyTaskReceipt(r, item.IssueID, comment.ID)
 	writeJSON(w, http.StatusCreated, map[string]any{
