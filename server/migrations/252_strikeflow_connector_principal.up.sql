@@ -1,6 +1,6 @@
 -- Purpose-built, non-human principal for the private StrikeFlow projection.
 -- The plaintext token is returned once and is never stored.
-CREATE TABLE strikeflow_connector_token (
+CREATE TABLE IF NOT EXISTS strikeflow_connector_token (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
     recipient_id UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -21,13 +21,13 @@ CREATE TABLE strikeflow_connector_token (
     CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
 );
 
-CREATE INDEX idx_strikeflow_connector_active
+CREATE INDEX IF NOT EXISTS idx_strikeflow_connector_active
     ON strikeflow_connector_token (workspace_id, recipient_id, expires_at)
     WHERE revoked_at IS NULL;
 
 -- Durable, append-only security/event trail. Bodies and token values are never
 -- stored; object ids and payload hashes are enough to reconcile a connector run.
-CREATE TABLE strikeflow_connector_audit (
+CREATE TABLE IF NOT EXISTS strikeflow_connector_audit (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     token_id UUID NOT NULL,
     workspace_id UUID NOT NULL,
@@ -43,15 +43,17 @@ CREATE TABLE strikeflow_connector_audit (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_strikeflow_connector_audit_token_created
+CREATE INDEX IF NOT EXISTS idx_strikeflow_connector_audit_token_created
     ON strikeflow_connector_audit (token_id, created_at DESC);
 
-CREATE FUNCTION reject_strikeflow_connector_audit_mutation()
+CREATE OR REPLACE FUNCTION reject_strikeflow_connector_audit_mutation()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     RAISE EXCEPTION 'strikeflow connector audit is append-only';
 END;
 $$;
+
+DROP TRIGGER IF EXISTS strikeflow_connector_audit_immutable ON strikeflow_connector_audit;
 
 CREATE TRIGGER strikeflow_connector_audit_immutable
     BEFORE UPDATE OR DELETE ON strikeflow_connector_audit
@@ -60,7 +62,7 @@ CREATE TRIGGER strikeflow_connector_audit_immutable
 -- Reservation-before-side-effect makes reply retries crash-safe. A retry with
 -- the same key and hash either replays the committed receipt or recovers the
 -- server-generated marker; a different hash is always a conflict.
-CREATE TABLE strikeflow_connector_reply_receipt (
+CREATE TABLE IF NOT EXISTS strikeflow_connector_reply_receipt (
     token_id UUID NOT NULL REFERENCES strikeflow_connector_token(id) ON DELETE CASCADE,
     idempotency_key UUID NOT NULL,
     inbox_item_id UUID NOT NULL REFERENCES inbox_item(id) ON DELETE CASCADE,
