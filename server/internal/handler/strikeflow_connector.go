@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -310,6 +311,139 @@ type strikeFlowBoundItem struct {
 	IssueID       pgtype.UUID
 	ProjectID     pgtype.UUID
 	RootCommentID pgtype.UUID
+	SourceType    string
+}
+
+// strikeFlowEligibleInboxCondition is deliberately shared by the list and
+// item loaders. The new_comment arm is not a generic subscriber-notification
+// adapter: it projects only the initial, root-level output of one completed
+// directly-human-originated agent assignment back to that same human.
+const strikeFlowEligibleInboxCondition = `
+	(
+		ii.type IN ('agent_action_required','mentioned')
+		OR (
+			ii.type='new_comment'
+			AND ii.archived=false
+			AND i.status='in_review'
+			AND ii.actor_type='agent' AND ii.actor_id IS NOT NULL
+			AND jsonb_typeof(ii.details->'comment_id')='string'
+			AND EXISTS (
+				SELECT 1
+				FROM comment c
+				JOIN agent_task_queue t ON t.id=c.source_task_id
+				JOIN agent a ON a.id=c.author_id
+				WHERE c.id::text=ii.details->>'comment_id'
+				  AND c.workspace_id=ii.workspace_id
+				  AND c.issue_id=ii.issue_id
+				  AND c.parent_id IS NULL
+				  AND c.type='comment'
+				  AND c.author_type='agent'
+				  AND c.author_id=ii.actor_id
+				  AND a.workspace_id=ii.workspace_id
+				  AND a.archived_at IS NULL
+				  AND a.runtime_id IS NOT NULL
+				  AND i.assignee_type='agent'
+				  AND i.assignee_id=c.author_id
+				  AND t.issue_id=ii.issue_id
+				  AND t.agent_id=c.author_id
+				  AND t.runtime_id=a.runtime_id
+				  AND t.status='completed'
+				  AND t.completed_at IS NOT NULL
+				  AND t.originator_user_id=ii.recipient_id
+				  AND t.accountable_user_id=ii.recipient_id
+				  AND t.originator_source='direct_human'
+				  AND t.trigger_evidence_kind='issue_assignment'
+				  AND t.trigger_evidence_ref_id=ii.issue_id
+			)
+		)
+	)`
+
+type strikeFlowQueryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func loadStrikeFlowBoundItemFrom(
+	ctx context.Context,
+	queryer strikeFlowQueryRower,
+	scope middleware.StrikeFlowConnectorScope,
+	itemID pgtype.UUID,
+	lock bool,
+) (strikeFlowBoundItem, error) {
+	var item strikeFlowBoundItem
+	var details []byte
+	lockClause := ""
+	if lock {
+		lockClause = " FOR SHARE OF ii,i /* strikeflow_locked_inbox_recheck */"
+	}
+	query := fmt.Sprintf(`
+		SELECT ii.id,ii.issue_id,i.project_id,ii.details,ii.type
+		FROM inbox_item ii
+		JOIN issue i ON i.id=ii.issue_id AND i.workspace_id=ii.workspace_id
+		WHERE ii.id=$1 AND ii.workspace_id=$2 AND ii.recipient_type='member'
+		  AND ii.recipient_id=$3 AND %s%s
+	`, strikeFlowEligibleInboxCondition, lockClause)
+	if err := queryer.QueryRow(ctx, query, itemID, scope.WorkspaceID, scope.RecipientID).Scan(
+		&item.ItemID, &item.IssueID, &item.ProjectID, &details, &item.SourceType,
+	); err != nil || !scope.AllowsProject(util.UUIDToString(item.ProjectID)) {
+		return strikeFlowBoundItem{}, pgx.ErrNoRows
+	}
+	var parsed struct {
+		CommentID string `json:"comment_id"`
+	}
+	if json.Unmarshal(details, &parsed) != nil {
+		return strikeFlowBoundItem{}, fmt.Errorf("inbox item has no authoritative root")
+	}
+	root, err := util.ParseUUID(parsed.CommentID)
+	if err != nil {
+		return strikeFlowBoundItem{}, fmt.Errorf("inbox item has no authoritative root")
+	}
+	var exists bool
+	if err := queryer.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM comment WHERE id=$1 AND issue_id=$2 AND workspace_id=$3)
+	`, root, item.IssueID, scope.WorkspaceID).Scan(&exists); err != nil || !exists {
+		return strikeFlowBoundItem{}, fmt.Errorf("authoritative root not found")
+	}
+	item.RootCommentID = root
+
+	if lock && item.SourceType == "new_comment" {
+		// The first query locks the inbox item and issue. Re-run the complete
+		// evidence join while locking the root, task, and agent so none of the
+		// authorization facts can change before the reply transaction commits.
+		var locked bool
+		err := queryer.QueryRow(ctx, `
+			SELECT true
+			FROM inbox_item ii
+			JOIN issue i ON i.id=ii.issue_id AND i.workspace_id=ii.workspace_id
+			JOIN comment c ON c.id::text=ii.details->>'comment_id'
+				AND c.workspace_id=ii.workspace_id AND c.issue_id=ii.issue_id
+			JOIN agent_task_queue t ON t.id=c.source_task_id
+			JOIN agent a ON a.id=c.author_id
+			WHERE ii.id=$1 AND ii.workspace_id=$2
+			  AND ii.recipient_type='member' AND ii.recipient_id=$3
+			  AND ii.type='new_comment' AND ii.archived=false
+			  AND i.status='in_review'
+			  AND ii.actor_type='agent' AND ii.actor_id IS NOT NULL
+			  AND jsonb_typeof(ii.details->'comment_id')='string'
+			  AND c.parent_id IS NULL AND c.type='comment'
+			  AND c.author_type='agent' AND c.author_id=ii.actor_id
+			  AND a.workspace_id=ii.workspace_id AND a.archived_at IS NULL
+			  AND a.runtime_id IS NOT NULL
+			  AND i.assignee_type='agent' AND i.assignee_id=c.author_id
+			  AND t.issue_id=ii.issue_id AND t.agent_id=c.author_id
+			  AND t.runtime_id=a.runtime_id
+			  AND t.status='completed' AND t.completed_at IS NOT NULL
+			  AND t.originator_user_id=ii.recipient_id
+			  AND t.accountable_user_id=ii.recipient_id
+			  AND t.originator_source='direct_human'
+			  AND t.trigger_evidence_kind='issue_assignment'
+			  AND t.trigger_evidence_ref_id=ii.issue_id
+			FOR SHARE OF c,t,a
+		`, itemID, scope.WorkspaceID, scope.RecipientID).Scan(&locked)
+		if err != nil || !locked {
+			return strikeFlowBoundItem{}, pgx.ErrNoRows
+		}
+	}
+	return item, nil
 }
 
 func (h *Handler) loadStrikeFlowBoundItem(w http.ResponseWriter, r *http.Request, scope middleware.StrikeFlowConnectorScope) (strikeFlowBoundItem, bool) {
@@ -317,39 +451,11 @@ func (h *Handler) loadStrikeFlowBoundItem(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return strikeFlowBoundItem{}, false
 	}
-	var item strikeFlowBoundItem
-	var details []byte
-	err := h.DB.QueryRow(r.Context(), `
-		SELECT ii.id,ii.issue_id,i.project_id,ii.details
-		FROM inbox_item ii JOIN issue i ON i.id=ii.issue_id
-		WHERE ii.id=$1 AND ii.workspace_id=$2 AND ii.recipient_type='member'
-		  AND ii.recipient_id=$3 AND ii.type IN ('agent_action_required','mentioned')
-	`, itemID, scope.WorkspaceID, scope.RecipientID).
-		Scan(&item.ItemID, &item.IssueID, &item.ProjectID, &details)
-	if err != nil || !scope.AllowsProject(util.UUIDToString(item.ProjectID)) {
+	item, err := loadStrikeFlowBoundItemFrom(r.Context(), h.DB, scope, itemID, false)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "inbox item not found")
 		return strikeFlowBoundItem{}, false
 	}
-	var parsed struct {
-		CommentID string `json:"comment_id"`
-	}
-	if json.Unmarshal(details, &parsed) != nil {
-		writeError(w, http.StatusConflict, "inbox item has no authoritative root")
-		return strikeFlowBoundItem{}, false
-	}
-	root, err := util.ParseUUID(parsed.CommentID)
-	if err != nil {
-		writeError(w, http.StatusConflict, "inbox item has no authoritative root")
-		return strikeFlowBoundItem{}, false
-	}
-	var exists bool
-	if err := h.DB.QueryRow(r.Context(), `
-		SELECT EXISTS(SELECT 1 FROM comment WHERE id=$1 AND issue_id=$2 AND workspace_id=$3)
-	`, root, item.IssueID, scope.WorkspaceID).Scan(&exists); err != nil || !exists {
-		writeError(w, http.StatusConflict, "authoritative root not found")
-		return strikeFlowBoundItem{}, false
-	}
-	item.RootCommentID = root
 	return item, true
 }
 
@@ -383,16 +489,18 @@ func (h *Handler) ListStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
+	query := fmt.Sprintf(`
 		SELECT ii.id,ii.workspace_id,ii.recipient_type,ii.recipient_id,ii.type,ii.severity,
 		       ii.issue_id,ii.title,ii.body,ii.read,ii.archived,ii.created_at,
 		       ii.actor_type,ii.actor_id,ii.details,i.status,i.project_id
-		FROM inbox_item ii JOIN issue i ON i.id=ii.issue_id
+		FROM inbox_item ii
+		JOIN issue i ON i.id=ii.issue_id AND i.workspace_id=ii.workspace_id
 		WHERE ii.workspace_id=$1 AND ii.recipient_type='member' AND ii.recipient_id=$2
-		  AND ii.type IN ('agent_action_required','mentioned') AND ii.archived=false
+		  AND ii.archived=false AND %s
 		  AND i.project_id=ANY($3::uuid[])
 		ORDER BY ii.created_at DESC LIMIT 200
-	`, scope.WorkspaceID, scope.RecipientID, mapKeys(scope.Projects))
+	`, strikeFlowEligibleInboxCondition)
+	rows, err := h.DB.Query(r.Context(), query, scope.WorkspaceID, scope.RecipientID, mapKeys(scope.Projects))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list connector inbox")
 		return
@@ -660,12 +768,28 @@ func validStrikeFlowReply(message string) bool {
 		!strings.Contains(lower, "[strikeflow-content-reply:")
 }
 
+func strikeFlowReplyPayloadHash(
+	tokenID string,
+	itemID, issueID, rootCommentID pgtype.UUID,
+	message string,
+) string {
+	hashInput := strings.Join([]string{
+		tokenID,
+		util.UUIDToString(itemID),
+		util.UUIDToString(issueID),
+		util.UUIDToString(rootCommentID),
+		message,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(hashInput))
+	return hex.EncodeToString(sum[:])
+}
+
 func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	scope, ok := requireStrikeFlowScope(w, r, "inbox:reply")
 	if !ok {
 		return
 	}
-	item, ok := h.loadStrikeFlowBoundItem(w, r, scope)
+	itemID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "itemId"), "inbox item id")
 	if !ok {
 		return
 	}
@@ -680,21 +804,89 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	message := strings.TrimSpace(req.Message)
-	hashInput := strings.Join([]string{
-		scope.TokenID,
-		util.UUIDToString(item.ItemID),
-		util.UUIDToString(item.IssueID),
-		util.UUIDToString(item.RootCommentID),
-		message,
-	}, "\x00")
-	sum := sha256.Sum256([]byte(hashInput))
-	payloadHash := hex.EncodeToString(sum[:])
+
+	// A committed receipt is the durable authorization result of the original
+	// mutation. Exact retries must remain replayable even if the inbox item is
+	// later archived or the mutable issue/agent/task evidence changes.
+	replayTx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start connector replay")
+		return
+	}
+	var replayItem strikeFlowBoundItem
+	var replayHash string
+	var replayCommentID pgtype.UUID
+	err = replayTx.QueryRow(r.Context(), `
+		SELECT inbox_item_id,issue_id,root_comment_id,payload_hash,comment_id
+		FROM strikeflow_connector_reply_receipt
+		WHERE token_id=$1 AND idempotency_key=$2 AND comment_id IS NOT NULL
+		FOR SHARE
+	`, scope.TokenID, key).Scan(
+		&replayItem.ItemID, &replayItem.IssueID, &replayItem.RootCommentID,
+		&replayHash, &replayCommentID,
+	)
+	if err == nil {
+		expectedHash := strikeFlowReplyPayloadHash(
+			scope.TokenID,
+			replayItem.ItemID,
+			replayItem.IssueID,
+			replayItem.RootCommentID,
+			message,
+		)
+		if replayItem.ItemID != itemID || replayHash != expectedHash {
+			_ = replayTx.Rollback(r.Context())
+			writeError(w, http.StatusConflict, "idempotency key conflict")
+			return
+		}
+		if err := auditStrikeFlowConnector(
+			replayTx, r, scope, "inbox.reply", "replayed",
+			replayItem, replayCommentID, key, replayHash,
+		); err != nil {
+			_ = replayTx.Rollback(r.Context())
+			writeError(w, http.StatusInternalServerError, "failed to audit connector reply")
+			return
+		}
+		if err := replayTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to commit connector reply")
+			return
+		}
+		taskID := h.strikeFlowReplyTaskID(r, replayItem.IssueID, replayCommentID)
+		taskReceipt := h.strikeFlowReplyTaskReceipt(r, replayItem.IssueID, replayCommentID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"comment_id": util.UUIDToString(replayCommentID), "task_id": taskID,
+			"task": taskReceipt, "replayed": true,
+		})
+		return
+	}
+	rollbackErr := replayTx.Rollback(r.Context())
+	if err != pgx.ErrNoRows {
+		writeError(w, http.StatusInternalServerError, "failed to load connector replay")
+		return
+	}
+	if rollbackErr != nil && rollbackErr != pgx.ErrTxClosed {
+		writeError(w, http.StatusInternalServerError, "failed to close connector replay")
+		return
+	}
+
+	item, ok := h.loadStrikeFlowBoundItem(w, r, scope)
+	if !ok {
+		return
+	}
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to start connector reply")
 		return
 	}
 	defer tx.Rollback(r.Context())
+	lockedItem, err := loadStrikeFlowBoundItemFrom(r.Context(), tx, scope, item.ItemID, true)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "inbox item not found")
+		return
+	}
+	item = lockedItem
+	payloadHash := strikeFlowReplyPayloadHash(
+		scope.TokenID, item.ItemID, item.IssueID, item.RootCommentID, message,
+	)
 	qtx := h.Queries.WithTx(tx)
 	tag, err := tx.Exec(r.Context(), `
 			INSERT INTO strikeflow_connector_reply_receipt

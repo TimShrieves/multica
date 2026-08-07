@@ -141,6 +141,29 @@ func seedStrikeFlowIntegrationFixture(t *testing.T) strikeFlowIntegrationFixture
 	return f
 }
 
+func seedStrikeFlowNaturalReviewFixture(t *testing.T) strikeFlowIntegrationFixture {
+	t.Helper()
+	f := seedStrikeFlowIntegrationFixture(t)
+	if _, err := testPool.Exec(t.Context(),
+		`UPDATE issue SET status='in_review' WHERE id=$1`, f.issueID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE agent_task_queue
+		SET originator_source='direct_human',
+			trigger_evidence_kind='issue_assignment',
+			trigger_evidence_ref_id=$1
+		WHERE id=(SELECT source_task_id FROM comment WHERE id=$2)
+	`, f.issueID, f.rootID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(),
+		`UPDATE inbox_item SET type='new_comment',severity='info' WHERE id=$1`, f.itemID); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 func strikeFlowTestRootHash(rootID string) string {
 	raw, _ := json.Marshal(map[string]string{"reply_root_id": rootID})
 	sum := sha256.Sum256(raw)
@@ -1298,6 +1321,423 @@ func TestStrikeFlowConnectorSecurityBoundary(t *testing.T) {
 		`SELECT read,archived FROM inbox_item WHERE id=$1`, f.itemID).
 		Scan(&read, &archived); err != nil || !read || !archived {
 		t.Fatalf("read/archive not persisted: read=%v archived=%v err=%v", read, archived, err)
+	}
+	resp = strikeFlowRequest(t, f.valid, http.MethodGet, base+"/inbox/"+f.itemID+"/issue", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy archived direct item = %d, want baseline-compatible 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestStrikeFlowConnectorProjectsNaturalCompletedReview(t *testing.T) {
+	f := seedStrikeFlowNaturalReviewFixture(t)
+	base := "/api/integrations/strikeflow"
+
+	resp := strikeFlowRequest(t, f.valid, http.MethodGet, base+"/inbox", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("natural review list = %d, want 200", resp.StatusCode)
+	}
+	var list struct {
+		Items []map[string]any `json:"items"`
+	}
+	readJSON(t, resp, &list)
+	if len(list.Items) != 1 || list.Items[0]["id"] != f.itemID ||
+		list.Items[0]["type"] != "agent_action_required" ||
+		list.Items[0]["source_type"] != "new_comment" {
+		t.Fatalf("natural review projection mismatch: %#v", list.Items)
+	}
+	for _, token := range []string{f.wrongProject, f.wrongRecipient} {
+		resp = strikeFlowRequest(t, token, http.MethodGet, base+"/inbox", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("cross-boundary natural review list = %d, want 200", resp.StatusCode)
+		}
+		readJSON(t, resp, &list)
+		if len(list.Items) != 0 {
+			t.Fatalf("cross-boundary natural review was listed: %#v", list.Items)
+		}
+		resp = strikeFlowRequest(t, token, http.MethodGet,
+			base+"/inbox/"+f.itemID+"/issue", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("cross-boundary natural review item = %d, want 404", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	for _, suffix := range []string{"/issue", "/thread"} {
+		resp = strikeFlowRequest(t, f.valid, http.MethodGet,
+			base+"/inbox/"+f.itemID+suffix, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("natural review %s = %d, want 200", suffix, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	path := base + "/inbox/" + f.itemID + "/replies"
+	body := map[string]any{
+		"idempotency_key": "00000000-0000-4000-8000-000000000068",
+		"message":         "Continue this bounded review.",
+	}
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("natural review reply = %d, want 201", resp.StatusCode)
+	}
+	type replyResponse struct {
+		CommentID string `json:"comment_id"`
+		TaskID    string `json:"task_id"`
+		Replayed  bool   `json:"replayed"`
+		Task      struct {
+			ID                string `json:"id"`
+			AgentID           string `json:"agent_id"`
+			TriggerCommentID  string `json:"trigger_comment_id"`
+			OriginatorUserID  string `json:"originator_user_id"`
+			AccountableUserID string `json:"accountable_user_id"`
+		} `json:"task"`
+	}
+	var first replyResponse
+	readJSON(t, resp, &first)
+	if first.CommentID == "" || first.TaskID == "" || first.Replayed ||
+		first.Task.ID != first.TaskID || first.Task.AgentID != f.agentID ||
+		first.Task.TriggerCommentID != first.CommentID ||
+		first.Task.OriginatorUserID != testUserID ||
+		first.Task.AccountableUserID != testUserID {
+		t.Fatalf("natural review reply receipt mismatch: %#v", first)
+	}
+	if _, err := testPool.Exec(t.Context(),
+		`UPDATE inbox_item SET archived=true WHERE id=$1`, f.itemID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(),
+		`UPDATE issue SET status='done' WHERE id=$1`, f.issueID); err != nil {
+		t.Fatal(err)
+	}
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("durable natural review replay after evidence drift = %d, want 200", resp.StatusCode)
+	}
+	var replay replyResponse
+	readJSON(t, resp, &replay)
+	if replay.CommentID != first.CommentID || replay.TaskID != first.TaskID || !replay.Replayed {
+		t.Fatalf("natural review replay diverged: first=%#v replay=%#v", first, replay)
+	}
+	body["message"] = "Changed payload after evidence drift."
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("durable natural review conflicting replay = %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestStrikeFlowConnectorNaturalReviewEvidenceFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, strikeFlowIntegrationFixture)
+	}{
+		{name: "archived_item", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET archived=true WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "issue_not_in_review", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE issue SET status='done' WHERE id=$1`, f.issueID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "malformed_comment_id", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET details='{"comment_id":123}'::jsonb WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "missing_comment_id", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET details='{}'::jsonb WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "invalid_comment_id", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET details='{"comment_id":"not-a-uuid"}'::jsonb WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "member_actor", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET actor_type='member' WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "actor_mismatch", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE inbox_item SET actor_id=gen_random_uuid() WHERE id=$1`, f.itemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "non_root_comment", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			var parentID string
+			if err := testPool.QueryRow(t.Context(), `
+				INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type)
+				VALUES($1,$2,'agent',$3,'Parent','comment') RETURNING id
+			`, f.issueID, testWorkspaceID, f.agentID).Scan(&parentID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testPool.Exec(t.Context(), `UPDATE comment SET parent_id=$2 WHERE id=$1`, f.rootID, parentID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_comment_type", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE comment SET type='progress_update' WHERE id=$1`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "member_comment_author", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE comment SET author_type='member' WHERE id=$1`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_assignee", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE issue SET assignee_type='member',assignee_id=$2 WHERE id=$1`, f.issueID, testUserID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "archived_agent", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			if _, err := testPool.Exec(t.Context(), `UPDATE agent SET archived_at=now() WHERE id=$1`, f.agentID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = testPool.Exec(context.Background(), `UPDATE agent SET archived_at=NULL WHERE id=$1`, f.agentID)
+			})
+		}},
+		{name: "missing_source_task", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE comment SET source_task_id=NULL WHERE id=$1`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "failed_source_task", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET status='failed' WHERE id=(SELECT source_task_id FROM comment WHERE id=$1)`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "source_task_without_completed_at", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET completed_at=NULL WHERE id=(SELECT source_task_id FROM comment WHERE id=$1)`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_originator", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `
+				UPDATE agent_task_queue SET originator_user_id=v.id,accountable_user_id=v.id
+				FROM (SELECT gen_random_uuid() AS id) v
+				WHERE agent_task_queue.id=(SELECT source_task_id FROM comment WHERE id=$1)
+			`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_originator_source", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET originator_source='comment_source' WHERE id=(SELECT source_task_id FROM comment WHERE id=$1)`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_trigger_kind", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET trigger_evidence_kind='comment' WHERE id=(SELECT source_task_id FROM comment WHERE id=$1)`, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong_trigger_ref", mutate: func(t *testing.T, f strikeFlowIntegrationFixture) {
+			_, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET trigger_evidence_ref_id=$2 WHERE id=(SELECT source_task_id FROM comment WHERE id=$1)`, f.rootID, f.rootID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := seedStrikeFlowNaturalReviewFixture(t)
+			tc.mutate(t, f)
+			base := "/api/integrations/strikeflow/inbox/" + f.itemID
+			resp := strikeFlowRequest(t, f.valid, http.MethodGet, "/api/integrations/strikeflow/inbox", nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("list = %d, want 200", resp.StatusCode)
+			}
+			var list struct {
+				Items []map[string]any `json:"items"`
+			}
+			readJSON(t, resp, &list)
+			if len(list.Items) != 0 {
+				t.Fatalf("ineligible evidence listed: %#v", list.Items)
+			}
+			for _, suffix := range []string{"/issue", "/thread"} {
+				resp = strikeFlowRequest(t, f.valid, http.MethodGet, base+suffix, nil)
+				if resp.StatusCode != http.StatusNotFound {
+					t.Fatalf("%s = %d, want 404", suffix, resp.StatusCode)
+				}
+				resp.Body.Close()
+			}
+			resp = strikeFlowRequest(t, f.valid, http.MethodPost, base+"/replies", map[string]any{
+				"idempotency_key": "00000000-0000-4000-8000-000000000067",
+				"message":         "Must not be accepted.",
+			})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("reply = %d, want 404", resp.StatusCode)
+			}
+			resp.Body.Close()
+			var comments, receipts int
+			if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM comment WHERE issue_id=$1 AND content LIKE '%strikeflow-agent-inbox:%'`, f.issueID).Scan(&comments); err != nil {
+				t.Fatal(err)
+			}
+			if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM strikeflow_connector_reply_receipt WHERE inbox_item_id=$1`, f.itemID).Scan(&receipts); err != nil {
+				t.Fatal(err)
+			}
+			if comments != 0 || receipts != 0 {
+				t.Fatalf("ineligible reply persisted effects: comments=%d receipts=%d", comments, receipts)
+			}
+		})
+	}
+}
+
+func TestStrikeFlowConnectorNaturalReviewMalformedSiblingDoesNotPoisonList(t *testing.T) {
+	f := seedStrikeFlowNaturalReviewFixture(t)
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO inbox_item(workspace_id,recipient_type,recipient_id,type,severity,
+			issue_id,title,actor_type,actor_id,details)
+		VALUES($1,'member',$2,'new_comment','info',$3,'Malformed sibling',
+			'agent',$4,'{"comment_id":"not-a-uuid"}'::jsonb)
+	`, testWorkspaceID, testUserID, f.issueID, f.agentID); err != nil {
+		t.Fatal(err)
+	}
+	resp := strikeFlowRequest(t, f.valid, http.MethodGet, "/api/integrations/strikeflow/inbox", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list = %d, want 200", resp.StatusCode)
+	}
+	var list struct {
+		Items []map[string]any `json:"items"`
+	}
+	readJSON(t, resp, &list)
+	if len(list.Items) != 1 || list.Items[0]["id"] != f.itemID {
+		t.Fatalf("malformed sibling poisoned list: %#v", list.Items)
+	}
+}
+
+func TestStrikeFlowConnectorNaturalReviewDoesNotCollapseDuplicates(t *testing.T) {
+	f := seedStrikeFlowNaturalReviewFixture(t)
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO inbox_item(workspace_id,recipient_type,recipient_id,type,severity,
+			issue_id,title,body,actor_type,actor_id,details)
+		SELECT workspace_id,recipient_type,recipient_id,type,severity,
+			issue_id,title,body,actor_type,actor_id,details
+		FROM inbox_item WHERE id=$1
+	`, f.itemID); err != nil {
+		t.Fatal(err)
+	}
+	resp := strikeFlowRequest(t, f.valid, http.MethodGet, "/api/integrations/strikeflow/inbox", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list = %d, want 200", resp.StatusCode)
+	}
+	var list struct {
+		Items []map[string]any `json:"items"`
+	}
+	readJSON(t, resp, &list)
+	if len(list.Items) != 2 {
+		t.Fatalf("duplicate qualifying evidence was silently collapsed: %#v", list.Items)
+	}
+}
+
+func TestStrikeFlowConnectorNaturalReviewRechecksLockedEvidenceBeforeReply(t *testing.T) {
+	f := seedStrikeFlowNaturalReviewFixture(t)
+	blocker, err := testPool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(t.Context(), `SELECT id FROM issue WHERE id=$1 FOR UPDATE`, f.issueID); err != nil {
+		t.Fatal(err)
+	}
+	key := "00000000-0000-4000-8000-000000000066"
+	type replyResult struct {
+		resp *http.Response
+		err  error
+	}
+	result := make(chan replyResult, 1)
+	go func() {
+		raw, marshalErr := json.Marshal(map[string]any{
+			"idempotency_key": key, "message": "Stale admission must not write.",
+		})
+		if marshalErr != nil {
+			result <- replyResult{err: marshalErr}
+			return
+		}
+		req, requestErr := http.NewRequest(http.MethodPost,
+			testServer.URL+"/api/integrations/strikeflow/inbox/"+f.itemID+"/replies",
+			bytes.NewReader(raw))
+		if requestErr != nil {
+			result <- replyResult{err: requestErr}
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+f.valid)
+		req.Header.Set("Content-Type", "application/json")
+		response, requestErr := http.DefaultClient.Do(req)
+		result <- replyResult{resp: response, err: requestErr}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var blocked bool
+		if err := testPool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname=current_database()
+				  AND query LIKE '%strikeflow_locked_inbox_recheck%'
+				  AND cardinality(pg_blocking_pids(pid)) > 0
+			)
+		`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reply did not reach the locked transactional evidence recheck")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := blocker.Exec(t.Context(), `UPDATE issue SET status='done' WHERE id=$1`, f.issueID); err != nil {
+		t.Fatal(err)
+	}
+	if err := blocker.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got := <-result
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	resp := got.resp
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("stale reply = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var comments, receipts int
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM comment
+		WHERE issue_id=$1 AND content LIKE '%' || $2 || '%'
+	`, f.issueID, "[strikeflow-agent-inbox:"+key+"]").Scan(&comments); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_connector_reply_receipt
+		WHERE inbox_item_id=$1 AND idempotency_key=$2
+	`, f.itemID, key).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if comments != 0 || receipts != 0 {
+		t.Fatalf("stale admission persisted effects: comments=%d receipts=%d", comments, receipts)
 	}
 }
 
