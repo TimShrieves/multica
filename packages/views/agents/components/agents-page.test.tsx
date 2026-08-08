@@ -90,6 +90,8 @@ vi.mock("sonner", () => ({
 }));
 
 vi.mock("@multica/core/agents", () => ({
+  isAgentRuntimeBound: (agent: { runtime_id: string; runtime_bound?: boolean }) =>
+    agent.runtime_bound !== false && agent.runtime_id.length > 0,
   agentRunCounts30dOptions: () => ({ queryKey: ["agent-run-counts"] }),
   useWorkspaceActivityMap: () => mocks.activity,
   useWorkspacePresenceMap: () => mocks.presence,

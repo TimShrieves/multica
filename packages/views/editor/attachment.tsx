@@ -23,6 +23,7 @@
  * hints (selected, editable, onDelete).
  */
 
+import { useEffect, useState } from "react";
 import {
   Download,
   Link as LinkIcon,
@@ -313,6 +314,14 @@ function hasExpiringSignatureQuery(q: URLSearchParams): boolean {
 // signature from the query cache.
 const RESIGN_STALE_MS = 20 * 60 * 1000;
 
+// How long fetched image bytes stay in the query cache after the last <img>
+// using them unmounts. The bytes themselves never go stale (an attachment id
+// maps to an immutable storage object), so the blob query uses
+// `staleTime: Infinity`; this bound exists purely to keep a long scroll
+// through an image-heavy thread from pinning every decoded screenshot in
+// renderer memory forever.
+const INLINE_BLOB_GC_MS = 5 * 60 * 1000;
+
 // useResignedInlineMediaURL upgrades an auth-gated media URL to a freshly
 // signed one for clients that cannot load `/api/attachments/<id>/download`
 // natively.
@@ -330,12 +339,24 @@ const RESIGN_STALE_MS = 20 * 60 * 1000;
 //
 // For them, fetch fresh attachment metadata through the authenticated API —
 // the same re-sign the click-time download path already does — and swap in
-// the response's signed `download_url`. When the server has no signed URL to
-// offer (non-CloudFront deployments return the API path again), keep the
-// original URL rather than looping.
+// the response's signed `download_url`.
+//
+// The server only has a signed URL to offer under CloudFront signing or
+// presign mode. In **proxy** download mode `GetAttachmentByID` hands back the
+// auth-gated API path again, and before MUL-5445 the renderer simply kept the
+// original URL — the image stayed broken and the metadata request was pure
+// overhead. Proxy is not an exotic setting: the default `auto` mode forces it
+// whenever the storage URL points at an internal host, which is exactly the
+// docker-compose MinIO (`http://minio:9000`) self-host shape. So when the
+// refreshed metadata confirms there is no signed URL, fall back to pulling the
+// bytes through the authenticated client and rendering them from an object
+// URL. `blobFallback` gates that on the caller actually rendering a native
+// `<img>`: a file card only needs a link, and downloading a 100 MB archive
+// into renderer memory to draw a chip would be a bad trade.
 function useResignedInlineMediaURL(
   attachmentId: string | undefined,
   pickedUrl: string,
+  blobFallback: boolean,
 ): string {
   const idFromPickedUrl = attachmentIdFromDownloadURL(pickedUrl);
   const resignAttachmentId = attachmentId ?? idFromPickedUrl;
@@ -363,15 +384,56 @@ function useResignedInlineMediaURL(
     gcTime: RESIGN_STALE_MS,
   });
 
-  if (!needsResign) return pickedUrl;
   const dl = fresh?.download_url ?? "";
   // Accept the fresh URL only when it is an actual upgrade — absolute and no
   // longer the auth-gated API shape (i.e. a signed storage URL the renderer
   // can load natively).
-  if (/^https?:\/\//i.test(dl) && attachmentIdFromDownloadURL(dl) === undefined) {
-    return dl;
-  }
-  return pickedUrl;
+  const signedUrl =
+    /^https?:\/\//i.test(dl) && attachmentIdFromDownloadURL(dl) === undefined
+      ? dl
+      : "";
+
+  // Only after `fresh` has landed do we know this deployment has nothing
+  // signed to give — firing the byte fetch earlier would double-download on
+  // every CloudFront / presign client.
+  const { data: blob } = useQuery({
+    queryKey: ["attachment-inline-blob", resignAttachmentId],
+    queryFn: () => api.getAttachmentBlob(resignAttachmentId as string),
+    enabled: needsResign && blobFallback && !!fresh && signedUrl === "",
+    staleTime: Infinity,
+    gcTime: INLINE_BLOB_GC_MS,
+  });
+  const blobUrl = useObjectURL(blob);
+
+  if (!needsResign) return pickedUrl;
+  if (signedUrl) return signedUrl;
+  return blobUrl || pickedUrl;
+}
+
+// useObjectURL turns a Blob into a `blob:` URL for the lifetime of the calling
+// component, revoking it on unmount / replacement so the bytes are released
+// once nothing renders them. Returns "" while there is no blob (and during
+// SSR, where createObjectURL does not exist).
+function useObjectURL(blob: Blob | undefined): string {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    if (!blob || typeof URL.createObjectURL !== "function") {
+      setUrl("");
+      return;
+    }
+    const next = URL.createObjectURL(blob);
+    setUrl(next);
+    return () => {
+      URL.revokeObjectURL(next);
+    };
+  }, [blob]);
+  return url;
+}
+
+// isObjectURL flags a src that only resolves inside this renderer session —
+// safe to paint, wrong to expose through Copy Link or persist anywhere.
+function isObjectURL(rawUrl: string): boolean {
+  return /^blob:/i.test(rawUrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +454,6 @@ export function Attachment({
   const preview = useAttachmentPreview();
 
   const state = normalize(attachment, resolveAttachment, cdnDomain, cdnSigned);
-  // The picked URL may still be the auth-gated API endpoint (reopened drafts
-  // whose persisted record has no signed download_url). Upgrade it to a
-  // freshly signed URL on clients that can't load the endpoint natively.
-  const mediaUrl = useResignedInlineMediaURL(state.attachmentId, state.url);
   const forceKind =
     attachment.kind === "url" ? attachment.forceKind : undefined;
   const kind =
@@ -403,6 +461,20 @@ export function Attachment({
     (state.filename || state.contentType
       ? getPreviewKind(state.contentType, state.filename)
       : null);
+  // The picked URL may still be the auth-gated API endpoint (reopened drafts
+  // whose persisted record has no signed download_url). Upgrade it to a
+  // freshly signed URL on clients that can't load the endpoint natively, or —
+  // on deployments that have no signed URL to give — to an object URL built
+  // from the authenticated byte fetch. Only the image branch renders a native
+  // resource load, so only it opts into that byte fetch.
+  const mediaUrl = useResignedInlineMediaURL(
+    state.attachmentId,
+    state.url,
+    kind === "image",
+  );
+  // Object URLs are session-local, so anything that hands a URL to the user or
+  // to another surface keeps the durable pick instead.
+  const shareUrl = isObjectURL(mediaUrl) ? state.url : mediaUrl;
 
   const openPreview = () => {
     if (state.record) {
@@ -429,7 +501,7 @@ export function Attachment({
       download(state.attachmentId);
       return;
     }
-    if (mediaUrl) openByUrl(mediaUrl);
+    if (shareUrl) openByUrl(shareUrl);
   };
 
   if (kind === "image") {
@@ -437,6 +509,7 @@ export function Attachment({
       <>
         <ImageAttachmentView
           src={mediaUrl}
+          linkUrl={shareUrl}
           alt={state.filename}
           uploading={state.uploading}
           width={state.width}
@@ -474,7 +547,7 @@ export function Attachment({
         filename={state.filename}
         contentType={state.contentType}
         attachmentId={state.attachmentId}
-        href={mediaUrl || undefined}
+        href={shareUrl || undefined}
         uploading={state.uploading}
         onPreview={openPreview}
         onDownload={handleDownload}
@@ -497,6 +570,12 @@ export function Attachment({
 
 interface ImageAttachmentViewProps {
   src: string;
+  /**
+   * URL handed to the user by Copy Link. Splits from `src` only when `src` is
+   * a session-local object URL (proxy-mode byte fallback) — pasting a `blob:`
+   * URL anywhere outside this renderer resolves to nothing.
+   */
+  linkUrl: string;
   alt: string;
   uploading: boolean;
   width?: number;
@@ -511,6 +590,7 @@ interface ImageAttachmentViewProps {
 
 function ImageAttachmentView({
   src,
+  linkUrl,
   alt,
   uploading,
   width,
@@ -525,7 +605,7 @@ function ImageAttachmentView({
   const { t } = useT("editor");
 
   const handleCopyLink = async () => {
-    if (await copyText(src)) {
+    if (await copyText(linkUrl)) {
       toast.success(t(($) => $.image.link_copied));
     } else {
       toast.error(t(($) => $.image.copy_link_failed));

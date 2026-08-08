@@ -118,6 +118,7 @@ export const RUNTIME_PROFILE_PROTOCOL_FAMILIES = [
   "kiro",
   "antigravity",
   "qoder",
+  "qoderclicn",
   "traecli",
   "grok",
   "qwen",
@@ -372,7 +373,16 @@ export interface AgentTask {
 export interface Agent {
   id: string;
   workspace_id: string;
+  /**
+   * Empty string when the agent is unbound: it kept its configuration, chats and
+   * task history when its runtime was deleted, and needs a new runtime before it
+   * can run again (MUL-5559). Use `isAgentRuntimeBound` so additive and legacy
+   * signals stay compatible, and do not confuse it with a bound-but-offline
+   * runtime — that one just needs the machine back.
+   */
   runtime_id: string;
+  /** False exactly when the agent has no runtime. Older backends omit it. */
+  runtime_bound?: boolean;
   name: string;
   description: string;
   instructions: string;
@@ -1042,6 +1052,15 @@ export interface RuntimeModelListRequest {
   error?: string;
   created_at: string;
   updated_at: string;
+  /**
+   * True when the server answered from its own catalog cache instead of a live
+   * daemon round trip (MUL-5444). Informational only: such a response already
+   * arrives with `status: "completed"` and a populated `models`, so callers
+   * that ignore this field behave exactly as before. `cached_at` is the
+   * snapshot's capture time.
+   */
+  cached?: boolean;
+  cached_at?: string;
 }
 
 // Result shape returned by resolveRuntimeModels — includes the
@@ -1050,6 +1069,15 @@ export interface RuntimeModelListRequest {
 export interface RuntimeModelsResult {
   models: RuntimeModel[];
   supported: boolean;
+  /**
+   * True when the server answered from its catalog cache rather than a live
+   * daemon round trip (MUL-5444). Drives the query's freshness policy: a
+   * cached answer is immediately revalidatable so the client never extends the
+   * server's staleness window.
+   */
+  cached?: boolean;
+  /** Capture time of the served snapshot, when the answer was cached. */
+  cachedAt?: string;
 }
 
 export type RuntimeLocalSkillStatus =

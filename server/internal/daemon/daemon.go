@@ -27,6 +27,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
 	"github.com/multica-ai/multica/server/internal/selfexec"
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
@@ -74,7 +75,21 @@ const (
 	// intentionally independent from AgentTimeout, which only governs the
 	// provider process after the task reaches running.
 	defaultTaskPrepareTimeout = 5 * time.Minute
+	// pendingWorkHeartbeatTimeout bounds the out-of-band heartbeat a
+	// server-pushed daemon:pending_work hint triggers (MUL-5444). Short on
+	// purpose: the hint is only a latency optimisation, and the scheduled
+	// heartbeat still picks the request up if this attempt fails.
+	pendingWorkHeartbeatTimeout = 15 * time.Second
+	// pendingWorkHintBookkeepingTTL is how long a runtime's last-hint timestamp
+	// is retained before it is swept — purely to keep the map bounded.
+	pendingWorkHintBookkeepingTTL = 10 * time.Minute
 )
+
+// pendingWorkHintMinInterval is the floor between two hint-driven heartbeats
+// for the same runtime. Keeps an interactive first open instant while stopping a
+// caller-triggered hint from becoming a heartbeat amplifier. A var so tests can
+// shrink it, same as the other timing knobs in this package.
+var pendingWorkHintMinInterval = time.Second
 
 func repoCheckoutModeFor(provider, goos string) string {
 	if provider == "codex" && goos == "linux" {
@@ -145,6 +160,11 @@ type terminalTaskReport struct {
 	// session because its rollout was not in the store (MUL-5305). The server
 	// clears the resume pointer and flags the continuity gap for the next claim.
 	sessionRolloutMissing bool
+	// retiredSessionID names a session this run was told to resume and then
+	// abandoned as unresumable (GH #6066). The server records it so no later
+	// run on the issue or chat can select it again, however many clean rows
+	// still reference it.
+	retiredSessionID string
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -223,6 +243,7 @@ type workspaceState struct {
 
 type repoCacheBackend interface {
 	Lookup(workspaceID, url string) string
+	BarePath(workspaceID, url string) string
 	Sync(workspaceID string, repos []repocache.RepoInfo) error
 	WithRepoLock(barePath string, fn func() error) error
 	CreateWorktree(params repocache.WorktreeParams) (*repocache.WorktreeResult, error)
@@ -327,6 +348,16 @@ type Daemon struct {
 	reregisterNextAttempt     map[string]time.Time // workspace_id -> earliest time the next re-register attempt may run
 	reregisterLastCompletedAt map[string]time.Time // workspace_id -> wall-clock at which the last SUCCESSFUL re-register call returned (failures intentionally not stamped — see recordRegisterCompletion)
 
+	// pendingWorkMu guards pendingWorkInflight and pendingWorkLastRun, which
+	// coalesce and rate-limit server-pushed "heartbeat now" hints (MUL-5444).
+	// Several UI surfaces can request the same runtime's model list within
+	// milliseconds; without the guard each hint would fire its own out-of-band
+	// heartbeat, and an authenticated caller looping the list-models endpoint
+	// could turn that into a heartbeat amplifier.
+	pendingWorkMu       sync.Mutex
+	pendingWorkInflight map[string]struct{}  // runtime_id -> hint-driven heartbeat in flight
+	pendingWorkLastRun  map[string]time.Time // runtime_id -> when the last hint-driven heartbeat started
+
 	cancelFunc    context.CancelFunc // set by Run(); called by triggerRestart
 	rootCtx       context.Context    // set by Run(); used by long-running recoveries that must survive per-runtime ctx cancellation
 	restartBinary string             // non-empty after a successful update; path to the new binary
@@ -423,6 +454,8 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		deletingCodexStores:       make(map[string]bool),
 		localPathLocks:            NewLocalPathLocker(),
 		runtimeGoneInflight:       make(map[string]struct{}),
+		pendingWorkInflight:       make(map[string]struct{}),
+		pendingWorkLastRun:        make(map[string]time.Time),
 		reregisterNextAttempt:     make(map[string]time.Time),
 		reregisterLastCompletedAt: make(map[string]time.Time),
 		cancelPollInterval:        5 * time.Second,
@@ -1881,6 +1914,45 @@ func (d *Daemon) workspaceRepoAllowed(workspaceID, repoURL string) bool {
 	return false
 }
 
+// repoBarePathIsLive reports whether some watched workspace still claims the
+// repo cached at barePath, so the GC can refuse to evict it.
+//
+// Answering per-path rather than materializing the whole set lets the GC ask
+// again immediately before it deletes. A snapshot taken once per cycle goes
+// stale while the caller runs git and filesystem work on each repo in turn,
+// which is exactly the window in which a workspace can re-attach one.
+//
+// It mirrors workspaceRepoAllowed by unioning both sources: allowedRepoURLs
+// (workspace-level bindings) and taskRepoURLs (project repos the server
+// surfaced through a task claim, which never appear in GetWorkspaceRepos).
+// Missing the second set would make the GC evict repos that tasks actively
+// check out.
+//
+// Read from in-memory state on purpose. The alternative — asking the server
+// for each workspace's repo list during GC — would make a transient API
+// failure look like "nothing is attached", and this set is what protects
+// caches from deletion.
+func (d *Daemon) repoBarePathIsLive(barePath string) bool {
+	if d.repoCache == nil || barePath == "" {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for workspaceID, ws := range d.workspaces {
+		for url := range ws.allowedRepoURLs {
+			if d.repoCache.BarePath(workspaceID, url) == barePath {
+				return true
+			}
+		}
+		for url := range ws.taskRepoURLs {
+			if d.repoCache.BarePath(workspaceID, url) == barePath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (d *Daemon) workspaceLastRepoSyncErr(workspaceID string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -2779,6 +2851,98 @@ func (d *Daemon) handleHeartbeatActions(ctx context.Context, runtimeID string, r
 	}
 }
 
+// handlePendingWorkHint reacts to a server-pushed daemon:pending_work frame by
+// sending ONE immediate heartbeat for the runtime, then dispatching whatever
+// that heartbeat claimed (MUL-5444).
+//
+// Why a heartbeat and not the work itself: the hint deliberately carries no
+// request payload, so the server never has to un-claim anything when delivery
+// fails, and a duplicated or replayed hint cannot duplicate work — the claim
+// stays atomic inside the store's PopPending. A hint that never arrives (daemon
+// offline, WS gap, relay drop) costs nothing but the pre-existing wait for the
+// next scheduled heartbeat.
+//
+// The HTTP heartbeat is used on purpose rather than queueing a WS frame: the
+// hint arrives on the read pump, the WS write path may be backed up or tearing
+// down, and this is a human-interactive, low-frequency path (a user opened a
+// model picker) where one extra request is cheaper than a missed wakeup. Note it
+// intentionally bypasses the wsHeartbeatRecentlyAcked suppression that the
+// scheduled HTTP tick honours — that suppression exists to avoid duplicate
+// periodic writes, not to block an explicitly requested pull.
+func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
+	if runtimeID == "" {
+		return
+	}
+	if d.findRuntime(runtimeID) == nil {
+		// Not one of ours (stale relay fanout, or the runtime was just pruned).
+		return
+	}
+
+	d.pendingWorkMu.Lock()
+	if d.pendingWorkInflight == nil {
+		d.pendingWorkInflight = make(map[string]struct{})
+	}
+	if d.pendingWorkLastRun == nil {
+		d.pendingWorkLastRun = make(map[string]time.Time)
+	}
+	// Drop long-idle bookkeeping so the map can't grow with every runtime this
+	// process has ever seen.
+	for id, at := range d.pendingWorkLastRun {
+		if time.Since(at) > pendingWorkHintBookkeepingTTL {
+			delete(d.pendingWorkLastRun, id)
+		}
+	}
+	if _, inflight := d.pendingWorkInflight[runtimeID]; inflight {
+		d.pendingWorkMu.Unlock()
+		return
+	}
+	// Rate limit per runtime. The hint is caller-triggered (any workspace member
+	// hitting the list-models endpoint), so without a floor a request loop would
+	// become a heartbeat amplifier. A suppressed hint costs nothing but the
+	// pre-existing wait for the scheduled heartbeat.
+	if last, ok := d.pendingWorkLastRun[runtimeID]; ok && time.Since(last) < pendingWorkHintMinInterval {
+		d.pendingWorkMu.Unlock()
+		d.logger.Debug("pending work hint throttled", "runtime_id", runtimeID, "kind", kind)
+		return
+	}
+	d.pendingWorkInflight[runtimeID] = struct{}{}
+	d.pendingWorkLastRun[runtimeID] = time.Now()
+	d.pendingWorkMu.Unlock()
+	defer func() {
+		d.pendingWorkMu.Lock()
+		delete(d.pendingWorkInflight, runtimeID)
+		d.pendingWorkMu.Unlock()
+	}()
+
+	// Root context: handleHeartbeatActions hands this ctx to the actual work
+	// (model discovery shells out to a CLI for up to ~15s), so it must outlive
+	// this function. Only the heartbeat request itself is time-bounded.
+	ctx := d.recoveryContext()
+	if ctx.Err() != nil {
+		return
+	}
+	hbCtx, cancel := context.WithTimeout(ctx, pendingWorkHeartbeatTimeout)
+	resp, err := d.client.SendHeartbeat(hbCtx, runtimeID)
+	cancel()
+	if err != nil {
+		if isRuntimeNotFoundError(err) {
+			go d.handleRuntimeGone(runtimeID)
+			return
+		}
+		d.logger.Debug("pending work hint heartbeat failed", "runtime_id", runtimeID, "kind", kind, "error", err)
+		return
+	}
+	if resp == nil {
+		return
+	}
+	if resp.RuntimeGone {
+		go d.handleRuntimeGone(runtimeID)
+		return
+	}
+	d.logger.Debug("pending work hint served", "runtime_id", runtimeID, "kind", kind)
+	d.handleHeartbeatActions(ctx, runtimeID, resp)
+}
+
 // handleModelList resolves the provider's supported models (via static
 // catalog or by shelling out to the agent CLI) and reports the result
 // back to the server. Model discovery failures are reported as empty
@@ -2798,13 +2962,18 @@ func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID stri
 	// Self-heal a pinned executable path an in-place upgrade deleted (MUL-4486).
 	entry, _ = d.resolveAgentEntry(ctx, rt.Provider, entry)
 
-	models, err := agent.ListModels(ctx, rt.Provider, entry.Path)
+	catalog, err := agent.ListModels(ctx, rt.Provider, entry.Path)
 	if err != nil {
 		d.reportModelListResult(ctx, rt, requestID, map[string]any{
 			"status": "failed",
 			"error":  err.Error(),
 		})
 		return
+	}
+	models := catalog.Models
+	if catalog.Fallback {
+		d.logger.Warn("model discovery fell back to a static catalog; reporting it as non-authoritative",
+			"runtime_id", rt.ID, "provider", rt.Provider, "path", entry.Path, "count", len(models))
 	}
 
 	// Wire format matches handler.ModelEntry. Use a struct (not
@@ -2869,6 +3038,10 @@ func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID stri
 		"status":    "completed",
 		"models":    wire,
 		"supported": agent.ModelSelectionSupported(rt.Provider),
+		// Additive field: the models are still worth rendering, but the server
+		// must not persist them as this runtime's real catalog (MUL-5549).
+		// Older servers ignore it and keep the previous behaviour.
+		"fallback": catalog.Fallback,
 	})
 }
 
@@ -3028,12 +3201,29 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 		return
 	}
 
-	// Prevent concurrent update attempts.
-	if !d.updating.CompareAndSwap(false, true) {
-		d.logger.Warn("update already in progress, ignoring", "runtime_id", runtimeID, "update_id", update.ID)
+	switch d.tryBeginServerUpdate(ctx) {
+	case serverUpdateAlreadyRunning:
+		d.logger.Warn("update deferred: another update is already in progress", "runtime_id", runtimeID, "update_id", update.ID)
+		d.reportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+			"status": "failed",
+			"error":  "another runtime update is already in progress on this machine",
+		})
+		return
+	case serverUpdateRuntimeBusy:
+		d.logger.Info("update deferred: task or claim in progress", "runtime_id", runtimeID, "update_id", update.ID)
+		d.reportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+			"status": "failed",
+			"error":  "runtime update deferred because agent work is starting or still active; retry when the machine is idle",
+		})
 		return
 	}
-	defer d.updating.Store(false)
+	restarting := false
+	defer func() {
+		if !restarting {
+			d.releaseClaimBarrier()
+			d.updating.Store(false)
+		}
+	}()
 
 	d.logger.Info("CLI update requested", "runtime_id", runtimeID, "update_id", update.ID, "target_version", update.TargetVersion)
 
@@ -3060,6 +3250,59 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 
 	// Trigger daemon restart with the new binary.
 	d.triggerRestart()
+	restarting = d.RestartBinary() != ""
+}
+
+type serverUpdateAcquireResult uint8
+
+const (
+	serverUpdateAcquired serverUpdateAcquireResult = iota
+	serverUpdateAlreadyRunning
+	serverUpdateRuntimeBusy
+)
+
+// tryBeginServerUpdate atomically claims update ownership, pauses new claims,
+// and lets any claim already in flight finish its handoff. An empty claim can
+// therefore never starve an update; a claim that returns work increments
+// activeTasks before exitClaim, so the final check still defers safely.
+func (d *Daemon) tryBeginServerUpdate(ctx context.Context) serverUpdateAcquireResult {
+	if !d.updating.CompareAndSwap(false, true) {
+		return serverUpdateAlreadyRunning
+	}
+
+	d.claimMu.Lock()
+	if d.pauseClaims || d.activeTasks.Load() > 0 {
+		d.claimMu.Unlock()
+		d.updating.Store(false)
+		return serverUpdateRuntimeBusy
+	}
+	d.pauseClaims = true
+	d.claimMu.Unlock()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		d.claimMu.Lock()
+		if d.claimsInFlight == 0 {
+			if d.activeTasks.Load() == 0 {
+				d.claimMu.Unlock()
+				return serverUpdateAcquired
+			}
+			d.pauseClaims = false
+			d.claimMu.Unlock()
+			d.updating.Store(false)
+			return serverUpdateRuntimeBusy
+		}
+		d.claimMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			d.releaseClaimBarrier()
+			d.updating.Store(false)
+			return serverUpdateRuntimeBusy
+		case <-ticker.C:
+		}
+	}
 }
 
 // runUpdate executes the brew-or-download upgrade against targetVersion and
@@ -3918,6 +4161,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
+			retiredSessionID:      result.RetiredSessionID,
 		})
 		if err == nil {
 			return
@@ -3955,6 +4199,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			workDir:               result.WorkDir,
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,
+			retiredSessionID:      result.RetiredSessionID,
 		}); failErr != nil {
 			taskLog.Error("fail task fallback also failed", "error", failErr)
 		}
@@ -3986,6 +4231,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			workDir:               result.WorkDir,
 			failureReason:         failureReason,
 			sessionRolloutMissing: result.SessionRolloutMissing,
+			retiredSessionID:      result.RetiredSessionID,
 		}); err != nil {
 			taskLog.Error("report failed task failed", "error", err)
 		}
@@ -4003,9 +4249,9 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing)
+		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -4048,9 +4294,10 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 // name when simple title-casing would read awkwardly. Providers not listed
 // here fall back to capitalizing the key (claude → "Claude", codex → "Codex").
 var runtimeDisplayNameOverrides = map[string]string{
-	"traecli": "Trae",
-	"grok":    "Grok",
-	"qwen":    "Qwen Code",
+	"traecli":    "Trae",
+	"grok":       "Grok",
+	"qoderclicn": "Qoder CN",
+	"qwen":       "Qwen Code",
 }
 
 // providerDisplayName returns the human-facing runtime name for a provider key.
@@ -4966,18 +5213,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env.CodexHome != "" {
 		agentEnv["CODEX_HOME"] = env.CodexHome
 	}
-	// Redirect HOME/XDG/npm_config_cache to the per-task writable home under the
-	// Linux codex workspace-write sandbox, where the real home is read-only. This
-	// lets tools that write to `~` (npm, Prisma, …) succeed without per-tool env
-	// tweaks. Set before custom_env below so a user override still wins for the
-	// non-blocklisted XDG keys; HOME itself stays blocklisted. Empty TaskHome
-	// (macOS/Windows, non-sandboxed providers) leaves the real HOME untouched
-	// (MUL-4856).
-	if env.TaskHome != "" {
-		for k, v := range execenv.TaskHomeEnv(env.TaskHome) {
-			agentEnv[k] = v
-		}
-	}
+	// HOME and the XDG base dirs are deliberately not touched here: tasks run
+	// with the daemon user's real home on every platform, so host CLI config
+	// and credentials resolve inside a task exactly as they do in the daemon
+	// user's shell (MUL-5578).
 	// (Hermes HERMES_HOME is applied after custom_env below so the per-task
 	// overlay can win over a user-set HERMES_HOME; see
 	// layerCustomEnvAndHermesHome.)
@@ -5183,6 +5422,21 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		execOpts.SystemPrompt = runtimeBrief
 	}
 
+	// A quick-actions refresh task from a server that predates server-side
+	// generation (MUL-5573). This daemon no longer has a suggestion pass to run
+	// it with, and it must NOT fall through to the ordinary chat path below:
+	// the task carries no user message, so the agent would answer a prompt
+	// nobody wrote and that server would persist the result as a real assistant
+	// reply. Complete it empty instead — the same shape the retired pass
+	// produced on this task, which that server writes no row for. The user's
+	// refresh spinner resolves via the client's own timeout.
+	if task.RegenerateQuickActionsFor != "" {
+		taskLog.Warn("refusing quick-actions refresh task from an older server; complete the daemon upgrade by updating the server",
+			"target_task", shortID(task.RegenerateQuickActionsFor),
+		)
+		return TaskResult{Status: "completed", Comment: "", WorkDir: env.WorkDir, EnvRoot: env.RootDir}, nil
+	}
+
 	taskLog.Debug("invoking backend",
 		"provider", provider,
 		"model", model,
@@ -5204,10 +5458,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return TaskResult{}, err
 	}
 
+	// retiredSessionID is the session this run was told to resume and then
+	// abandoned. Captured before the retry clears task.PriorSessionID, and
+	// reported on EVERY terminal path — the retry succeeding is exactly when
+	// the abandoned id would otherwise survive, unreferenced by this task's
+	// row but still reachable through an older completed row on the issue or
+	// through the chat_session pointer (GH #6066).
+	var retiredSessionID string
+	defer func() { taskResult.RetiredSessionID = retiredSessionID }()
+
 	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
+		retiredSessionID = task.PriorSessionID
 		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
 
 		// Rebuild cold-session context before the single retry. The prior
@@ -5347,14 +5611,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				FailureReason: reason,
 			}, nil
 		}
-		return TaskResult{
+		taskResult = TaskResult{
 			Status:    "completed",
 			Comment:   result.Output,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
 			Usage:     usageEntries,
-		}, nil
+		}
+		return taskResult, nil
 	case "timeout":
 		// Surface session_id/work_dir so the chat resume pointer is kept
 		// in sync even when the agent times out after building a session.
@@ -5501,6 +5766,28 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 	}
 	// Positive evidence: the backend proved the resume was refused.
 	if result.ResumeRejected {
+		return true
+	}
+	// Positive evidence of a different kind: the resume was NOT refused —
+	// the transcript loaded fine — and the provider then refused to replay
+	// it because a message in it is empty. ResumeRejected is false for every
+	// backend here precisely because nothing rejected the resume, which is
+	// why this needs its own branch rather than a phrase added to the
+	// rejection list.
+	//
+	// It applies to all 18 backends, not the ResumeRejectionUndetectable
+	// subset below, and that is deliberate: this is the one failure class
+	// where dropping the session is provably the fix without the backend
+	// having to detect anything. The evidence is in the provider's own error
+	// text, which the common layer already has. Leaving it to each adapter
+	// is how the same bug got fixed three times for Kiro, Kimi and Anthropic
+	// while every other backend stayed broken.
+	//
+	// The tools == 0 gate above still applies unchanged — a run that already
+	// used a tool is never re-run, poisoned history or not. Such a task still
+	// gets its session retired, just by classifyPoisonedError at report time
+	// rather than by an in-turn retry.
+	if taskfailure.UnresumableHistory(result.Error) {
 		return true
 	}
 	// Everything below is a bounded compatibility path for the backends that
@@ -5789,10 +6076,19 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					s := msgSeq.Add(1)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
-						Seq:   int(s),
-						Type:  "tool_use",
-						Tool:  msg.Tool,
-						Input: msg.Input,
+						Seq:  int(s),
+						Type: "tool_use",
+						Tool: msg.Tool,
+						// Redact before the payload leaves this process, not
+						// only on arrival. The server redacts again in its
+						// ingest handler, but that is the *remote* side: a
+						// daemon that self-updated ahead of the server — or one
+						// talking to a server mid-rollout — would otherwise ship
+						// whole-file edit contents (a deleted .env, a patched
+						// credential) to a peer that does not scrub nested
+						// values yet. Deployment order is not a control we
+						// have, so this side has to be safe on its own.
+						Input: redact.InputMap(msg.Input),
 					})
 					mu.Unlock()
 				case agent.MessageToolResult:

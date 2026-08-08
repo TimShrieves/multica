@@ -1,0 +1,4 @@
+-- The original connector schema was recorded historically as
+-- 235_strikeflow_connector_principal before upstream claimed prefix 235.
+-- This compatibility migration is intentionally non-destructive; production
+-- rollback is deployment-level and never uses migration-down.

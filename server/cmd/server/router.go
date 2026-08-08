@@ -69,6 +69,19 @@ var corsAllowedHeaders = []string{
 	"X-Client-Capabilities",
 }
 
+// corsExposedHeaders lists response headers browser clients are allowed to read.
+// Without this a custom response header is silently unreadable from JS on a
+// cross-origin request (only the CORS-safelisted response headers are exposed by
+// default) — the header arrives on the wire and then disappears, which looks
+// exactly like the server never sent it.
+//
+// Referencing the handler constant rather than re-typing the string keeps a
+// rename from quietly switching the signal off (MUL-5492).
+var corsExposedHeaders = []string{
+	handler.HeaderCommentsTruncated,
+	handler.HeaderTimelineTruncated,
+}
+
 func allowedOrigins() []string {
 	raw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
 	if raw == "" {
@@ -239,10 +252,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		if notifier, ok := opts.DaemonWakeup.(handler.WorkspaceSetRefreshNotifier); ok {
 			h.DaemonWorkspaceRefresh = notifier
 		}
+		if notifier, ok := opts.DaemonWakeup.(handler.DaemonPendingWorkNotifier); ok {
+			h.DaemonPendingWork = notifier
+		}
 	}
 	if rdb != nil {
 		h.UpdateStore = handler.NewRedisUpdateStore(rdb)
 		h.ModelListStore = handler.NewRedisModelListStore(rdb)
+		h.ModelCatalogCache = handler.NewRedisModelCatalogCache(rdb)
 		h.LocalSkillListStore = handler.NewRedisLocalSkillListStore(rdb)
 		h.LocalSkillImportStore = handler.NewRedisLocalSkillImportStore(rdb)
 		h.LivenessStore = handler.NewRedisLivenessStore(rdb)
@@ -704,6 +721,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		AllowedOrigins:   origins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   corsAllowedHeaders,
+		ExposedHeaders:   corsExposedHeaders,
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -867,6 +885,20 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
+	// Purpose-built StrikeFlow service surface. The msc_ credential is not a
+	// user PAT and can never enter the generic protected route tree below.
+	r.Route("/api/integrations/strikeflow", func(r chi.Router) {
+		r.Use(middleware.StrikeFlowConnectorAuth(pool))
+		r.Get("/inbox", h.ListStrikeFlowInbox)
+		r.Route("/inbox/{itemId}", func(r chi.Router) {
+			r.Get("/issue", h.GetStrikeFlowInboxIssue)
+			r.Get("/thread", h.ListStrikeFlowInboxThread)
+			r.Post("/read", h.MarkStrikeFlowInboxRead)
+			r.Post("/archive", h.ArchiveStrikeFlowInbox)
+			r.Post("/replies", h.ReplyStrikeFlowInbox)
+		})
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
@@ -953,6 +985,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					r.With(handler.RequireHumanActor).Post("/strikeflow-connector-tokens", h.CreateStrikeFlowConnectorToken)
+					r.With(handler.RequireHumanActor).Post("/strikeflow-connector-tokens/{tokenId}/rotate", h.RotateStrikeFlowConnectorToken)
+					r.With(handler.RequireHumanActor).Delete("/strikeflow-connector-tokens/{tokenId}", h.RevokeStrikeFlowConnectorToken)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
@@ -1129,9 +1164,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/subscribers", h.ListIssueSubscribers)
 					r.Post("/subscribe", h.SubscribeToIssue)
 					r.Post("/unsubscribe", h.UnsubscribeFromIssue)
+					r.Post("/unsubscribe/subtree", h.UnsubscribeFromIssueSubtree)
 					r.Get("/active-task", h.GetActiveTaskForIssue)
 					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
 					r.Post("/rerun", h.RerunIssue)
+					r.Post("/quick-actions/{quickActionId}/run", h.RunQuickAction)
+					r.Post("/quick-actions/{quickActionId}/render", h.RenderQuickAction)
 					r.Get("/task-runs", h.ListTasksByIssue)
 					r.Get("/usage", h.GetIssueUsage)
 					r.Post("/reactions", h.AddIssueReaction)
@@ -1152,6 +1190,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 			// Task messages (user-facing, not daemon auth)
 			r.Get("/api/tasks/{taskId}/messages", h.ListTaskMessagesByUser)
+
+			// Issue quick actions (definitions; running one lives under
+			// /api/issues/{id}/quick-actions/{quickActionId}/run)
+			r.Route("/api/quick-actions", func(r chi.Router) {
+				r.Get("/", h.ListQuickActions)
+				r.Post("/", h.CreateQuickAction)
+				r.Route("/{id}", func(r chi.Router) {
+					r.Patch("/", h.UpdateQuickAction)
+					r.Delete("/", h.DeleteQuickAction)
+				})
+			})
 
 			// Custom issue properties (definitions; values live under /api/issues/{id}/properties)
 			r.Route("/api/properties", func(r chi.Router) {
@@ -1360,13 +1409,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/local-skills/import", h.InitiateImportLocalSkill)
 					r.Get("/local-skills/import/{requestId}", h.GetLocalSkillImportRequest)
 					r.Delete("/", h.DeleteAgentRuntime)
-					// Cascade variant of DELETE: archive every active agent
-					// bound to this runtime, cancel their tasks, then delete
-					// the runtime — all in one transaction. Used by the
-					// DeleteRuntimeDialog when the strict DELETE refused with
-					// `runtime_has_active_agents` and the user confirmed the
-					// cascade plan.
-					r.Post("/archive-agents-and-delete", h.ArchiveAgentsAndDeleteRuntime)
+					// Confirmed variant of DELETE: unbind every agent bound to
+					// this runtime (they keep their configuration and chats and
+					// need a new runtime to run again), cancel their tasks,
+					// detach their task history, then delete the runtime — all
+					// in one transaction. Used by the DeleteRuntimeDialog when
+					// the strict DELETE refused with
+					// `runtime_has_active_agents` and the user confirmed.
+					r.Post("/unbind-agents-and-delete", h.UnbindAgentsAndDeleteRuntime)
+					// Legacy path for installed clients built against the
+					// archive-and-delete contract (MUL-5559 renamed the
+					// behaviour, not just the route). Same handler.
+					r.Post("/archive-agents-and-delete", h.UnbindAgentsAndDeleteRuntime)
 				})
 			})
 
@@ -1415,6 +1469,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/archive", h.SetChatSessionArchived)
 					r.Delete("/", h.DeleteChatSession)
 					r.Post("/messages", h.SendChatMessage)
+					// Explicit "refresh" of a turn's quick actions: re-runs the
+					// daemon suggestion pass for the latest assistant reply (MUL-5149).
+					r.Post("/quick-actions/regenerate", h.RegenerateChatQuickActions)
 					r.Get("/messages", h.ListChatMessages)
 					r.Get("/messages/page", h.ListChatMessagesPage)
 					r.Get("/pending-task", h.GetPendingChatTask)
@@ -1457,6 +1514,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/archive-all-read", h.ArchiveAllReadInbox)
 				r.Post("/archive-completed", h.ArchiveCompletedInbox)
 				r.Post("/{id}/read", h.MarkInboxRead)
+				r.Post("/{id}/unread", h.MarkInboxUnread)
 				r.Post("/{id}/archive", h.ArchiveInboxItem)
 				r.Post("/{id}/unarchive", h.UnarchiveInboxItem)
 			})

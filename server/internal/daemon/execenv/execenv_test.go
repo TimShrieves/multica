@@ -3,6 +3,7 @@ package execenv
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -129,10 +130,12 @@ func TestPrepareDirectoryMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read issue_context.md: %v", err)
 	}
-	for _, want := range []string{"a1b2c3d4-e5f6-7890-abcd-ef1234567890", "Code Review"} {
-		if !strings.Contains(string(content), want) {
-			t.Fatalf("issue_context.md missing %q", want)
-		}
+	if !strings.Contains(string(content), "a1b2c3d4-e5f6-7890-abcd-ef1234567890") {
+		t.Fatalf("issue_context.md missing the issue id")
+	}
+	// The skill list lives in the runtime brief only (MUL-5529).
+	if strings.Contains(string(content), "code-review") {
+		t.Fatalf("issue_context.md should no longer carry a skill list:\n%s", content)
 	}
 
 	markerContent, err := os.ReadFile(filepath.Join(env.WorkDir, TaskContextMarkerRelPath))
@@ -448,20 +451,17 @@ func TestWriteContextFiles(t *testing.T) {
 	}
 
 	s := string(content)
-	for _, want := range []string{
-		"test-issue-id-1234",
-		"## Agent Skills",
-		"Go Conventions",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("content missing %q", want)
-		}
+	if !strings.Contains(s, "test-issue-id-1234") {
+		t.Errorf("content missing %q", "test-issue-id-1234")
 	}
 
 	// Issue details should NOT be in the context file (agent fetches via CLI).
-	for _, absent := range []string{"## Description", "## Workspace Context"} {
+	//
+	// Nor the skill list: nothing ever read this copy, and the runtime brief
+	// carries the same names-only index (MUL-5529).
+	for _, absent := range []string{"## Description", "## Workspace Context", "## Agent Skills", "go-conventions"} {
 		if strings.Contains(s, absent) {
-			t.Errorf("content should NOT contain %q — agent fetches details via CLI", absent)
+			t.Errorf("content should NOT contain %q", absent)
 		}
 	}
 
@@ -941,12 +941,22 @@ func TestInjectRuntimeConfigClaude(t *testing.T) {
 		"Multica Agent Runtime",
 		"multica issue get",
 		"multica issue comment list",
-		"Go Conventions",
-		"PR Review",
+		// Skills are listed by on-disk slug: that is the directory
+		// writeSkillFiles creates and the only identifier the model can
+		// actually invoke (MUL-5529).
+		"go-conventions",
+		"pr-review",
 		"discovered automatically",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("CLAUDE.md missing %q", want)
+		}
+	}
+	// The display names must not leak into the listing — a model that reads
+	// "PR Review" and invokes it by that name gets nothing.
+	for _, absent := range []string{"Go Conventions", "PR Review"} {
+		if strings.Contains(s, absent) {
+			t.Errorf("CLAUDE.md lists display name %q instead of its slug", absent)
 		}
 	}
 }
@@ -1129,7 +1139,8 @@ func TestInjectRuntimeConfigCodex(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 }
@@ -1278,22 +1289,26 @@ func TestWriteContextFilesOpencodeNativeSkills(t *testing.T) {
 }
 
 // Skill content imported from upstream sources (GitHub, ClawHub, Skills.sh)
-// often already carries its own YAML frontmatter — possibly with a `name`
-// that differs from the DB row's display name to match a specific runtime's
-// expectations. The writer must not clobber that block; it should only
-// synthesize when frontmatter is absent.
-func TestWriteContextFilesPreservesExistingSkillFrontmatter(t *testing.T) {
+// often already carries its own YAML frontmatter. The writer keeps that block
+// verbatim with exactly one exception: `name` is forced to the directory slug.
+//
+// The exception exists because runtimes disagree on which field identifies a
+// skill — OpenCode routes on the frontmatter `name`, Claude on the directory
+// name. Leaving an upstream `name` in place therefore gives one skill two
+// different invocable names depending on where it runs (MUL-5529). This test
+// uses opencode precisely because it is the side that would route on the
+// upstream value.
+func TestWriteContextFilesForcesSkillFrontmatterNameToSlug(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
-	preExisting := "---\nname: upstream-name\ndescription: imported as-is\n---\n\nbody"
 	ctx := TaskContextForEnv{
-		IssueID: "preserve-frontmatter-test",
+		IssueID: "frontmatter-name-test",
 		AgentSkills: []SkillContextForEnv{
 			{
 				Name:        "Display Name",
 				Description: "overridden by upstream frontmatter",
-				Content:     preExisting,
+				Content:     "---\nname: upstream-name\ndescription: imported as-is\ncustom-key: keep me\n---\n\nbody",
 			},
 		},
 	}
@@ -1306,8 +1321,98 @@ func TestWriteContextFilesPreservesExistingSkillFrontmatter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read SKILL.md: %v", err)
 	}
-	if string(skillMd) != preExisting {
-		t.Errorf("SKILL.md was rewritten; got:\n%s\nwant:\n%s", skillMd, preExisting)
+
+	// name matches the directory it was written into, so both routing
+	// conventions resolve to the same skill.
+	want := "---\nname: display-name\ndescription: imported as-is\ncustom-key: keep me\n---\n\nbody"
+	if string(skillMd) != want {
+		t.Errorf("frontmatter name was not normalized to the slug; got:\n%s\nwant:\n%s", skillMd, want)
+	}
+}
+
+// The directory-name == frontmatter-name invariant must survive collision
+// fallback, where the allocated slug is NOT sanitizeSkillName(Name). A
+// user-installed skill already sitting at the natural slug pushes Multica's
+// copy to `<slug>-multica`; the frontmatter has to follow it there, or the
+// skill answers to the user's slug on Claude and to its own stale name on
+// OpenCode.
+func TestWriteContextFilesFrontmatterNameFollowsCollisionSlug(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Pre-create a user-owned skill at the natural slug.
+	userSkill := filepath.Join(dir, ".opencode", "skills", "review")
+	if err := os.MkdirAll(userSkill, 0o755); err != nil {
+		t.Fatalf("seed user skill: %v", err)
+	}
+	userContent := "---\nname: review\n---\n\nuser's own skill"
+	if err := os.WriteFile(filepath.Join(userSkill, "SKILL.md"), []byte(userContent), 0o644); err != nil {
+		t.Fatalf("seed user SKILL.md: %v", err)
+	}
+
+	ctx := TaskContextForEnv{
+		IssueID: "collision-test",
+		AgentSkills: []SkillContextForEnv{
+			{Name: "Review", Content: "---\nname: whatever-upstream-said\n---\n\nmultica body"},
+		},
+	}
+
+	if err := writeContextFiles(dir, "opencode", ctx, nil); err != nil {
+		t.Fatalf("writeContextFiles failed: %v", err)
+	}
+
+	// The user's directory is untouched.
+	got, err := os.ReadFile(filepath.Join(userSkill, "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read user SKILL.md: %v", err)
+	}
+	if string(got) != userContent {
+		t.Errorf("user skill was overwritten; got:\n%s", got)
+	}
+
+	// Multica's copy landed at the fallback slug and names itself after it.
+	moved, err := os.ReadFile(filepath.Join(dir, ".opencode", "skills", "review-multica", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read relocated SKILL.md: %v", err)
+	}
+	want := "---\nname: review-multica\n---\n\nmultica body"
+	if string(moved) != want {
+		t.Errorf("frontmatter name did not follow the collision slug; got:\n%s\nwant:\n%s", moved, want)
+	}
+}
+
+// The name rewrite must not disturb neighbouring keys, including a nested
+// mapping that happens to contain its own `name`. Only the top-level key is
+// the skill's identity; rewriting an indented one would splice a top-level key
+// into the middle of the nested block and corrupt the YAML.
+func TestWriteContextFilesLeavesNestedFrontmatterNameAlone(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ctx := TaskContextForEnv{
+		IssueID: "nested-name-test",
+		AgentSkills: []SkillContextForEnv{
+			{
+				Name:    "Nested",
+				Content: "---\nmetadata:\n  name: inner\n---\n\nbody",
+			},
+		},
+	}
+
+	if err := writeContextFiles(dir, "opencode", ctx, nil); err != nil {
+		t.Fatalf("writeContextFiles failed: %v", err)
+	}
+
+	skillMd, err := os.ReadFile(filepath.Join(dir, ".opencode", "skills", "nested", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("failed to read SKILL.md: %v", err)
+	}
+
+	// The block has no top-level name, so one is injected; `metadata.name`
+	// stays put.
+	want := "---\nname: nested\nmetadata:\n  name: inner\n---\n\nbody"
+	if string(skillMd) != want {
+		t.Errorf("nested name handling is wrong; got:\n%s\nwant:\n%s", skillMd, want)
 	}
 }
 
@@ -1454,6 +1559,33 @@ func TestWriteContextFilesQoderNativeSkills(t *testing.T) {
 	}
 }
 
+func TestWriteContextFilesQoderCNNativeSkills(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ctx := TaskContextForEnv{
+		IssueID: "qoderclicn-skill-test",
+		AgentSkills: []SkillContextForEnv{
+			{Name: "Go Conventions", Content: "Follow Go conventions."},
+		},
+	}
+
+	if err := writeContextFiles(dir, "qoderclicn", ctx, nil); err != nil {
+		t.Fatalf("writeContextFiles failed: %v", err)
+	}
+
+	skillMd, err := os.ReadFile(filepath.Join(dir, ".qoder", "skills", "go-conventions", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("failed to read .qoder/skills/go-conventions/SKILL.md: %v", err)
+	}
+	if !strings.Contains(string(skillMd), "Follow Go conventions.") {
+		t.Error("SKILL.md missing content")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".agent_context", "skills")); !os.IsNotExist(err) {
+		t.Error("expected .agent_context/skills/ to NOT exist for Qoder CN provider")
+	}
+}
+
 func TestWriteContextFilesQwenNativeSkills(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -1504,7 +1636,8 @@ func TestInjectRuntimeConfigOpencode(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 	if !strings.Contains(s, "discovered automatically") {
@@ -1539,7 +1672,8 @@ func TestInjectRuntimeConfigKiro(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 	if !strings.Contains(s, "discovered automatically") {
@@ -1569,11 +1703,34 @@ func TestInjectRuntimeConfigQoder(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 	if !strings.Contains(s, "discovered automatically") {
 		t.Error("AGENTS.md missing native skill discovery hint")
+	}
+}
+
+func TestInjectRuntimeConfigQoderCN(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ctx := TaskContextForEnv{
+		IssueID:     "test-qoderclicn-issue-id",
+		AgentSkills: []SkillContextForEnv{{Name: "Coding", Content: "Write good code."}},
+	}
+
+	if _, err := InjectRuntimeConfig(dir, "qoderclicn", ctx); err != nil {
+		t.Fatalf("InjectRuntimeConfig failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("failed to read AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(content), "Multica Agent Runtime") {
+		t.Error("AGENTS.md missing meta skill header")
 	}
 }
 
@@ -1602,7 +1759,8 @@ func TestInjectRuntimeConfigAntigravity(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 	if !strings.Contains(s, "discovered automatically") {
@@ -2051,7 +2209,8 @@ func TestInjectRuntimeConfigHermes(t *testing.T) {
 	if !strings.Contains(s, "Multica Agent Runtime") {
 		t.Error("AGENTS.md missing meta skill header")
 	}
-	if !strings.Contains(s, "Coding") {
+	// Listed by on-disk slug rather than the display name (MUL-5529).
+	if !strings.Contains(s, "coding") {
 		t.Error("AGENTS.md missing skill name")
 	}
 	// Hermes now discovers skills from the daemon-seeded per-task
@@ -2187,14 +2346,14 @@ func TestPrepareCodexHomeSeedsFromShared(t *testing.T) {
 		t.Errorf("config.json content = %q", data)
 	}
 
-	// config.toml should be copied and have network access appended.
+	// config.toml should be copied and have the managed sandbox block prepended.
 	data, _ = os.ReadFile(filepath.Join(codexHome, "config.toml"))
 	tomlStr := string(data)
 	if !strings.Contains(tomlStr, `model = "o3"`) {
 		t.Errorf("config.toml missing original model setting, got: %q", tomlStr)
 	}
-	if !strings.Contains(tomlStr, "network_access = true") {
-		t.Errorf("config.toml missing network_access, got: %q", tomlStr)
+	if !strings.Contains(tomlStr, "sandbox_mode = ") {
+		t.Errorf("config.toml missing managed sandbox_mode, got: %q", tomlStr)
 	}
 
 	// instructions.md should be copied.
@@ -2280,6 +2439,453 @@ func TestPrepareCodexHomeReportsMissingModelCatalogPath(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
 		}
+	}
+}
+
+// Regression test for MUL-5623 / #6271 — a user-level
+// `model_instructions_file = "./gpt-unrestricted.md"` survived the copy into the
+// per-task CODEX_HOME while the file it names did not, so Codex failed loading
+// its configuration before the task prompt was delivered.
+func TestPrepareCodexHomeCopiesRelativeModelInstructionsFile(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "./gpt-unrestricted.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "gpt-unrestricted.md"), []byte("Be direct."), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("prepareCodexHome failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexHome, "gpt-unrestricted.md"))
+	if err != nil {
+		t.Fatalf("read per-task instructions: %v", err)
+	}
+	if string(data) != "Be direct." {
+		t.Errorf("per-task instructions = %q", data)
+	}
+
+	// The copy must be isolated: a task editing its instructions cannot reach
+	// back into the user's real Codex home.
+	if err := os.WriteFile(filepath.Join(codexHome, "gpt-unrestricted.md"), []byte("tampered"), 0o644); err != nil {
+		t.Fatalf("rewrite per-task instructions: %v", err)
+	}
+	shared, err := os.ReadFile(filepath.Join(sharedHome, "gpt-unrestricted.md"))
+	if err != nil {
+		t.Fatalf("read shared instructions: %v", err)
+	}
+	if string(shared) != "Be direct." {
+		t.Errorf("shared instructions mutated by task: %q", shared)
+	}
+}
+
+// A nested reference must land at the same relative location inside the task
+// home. The path is built with filepath.Join so Windows exercises its own
+// separator, and the TOML literal string keeps that backslash verbatim.
+func TestPrepareCodexHomeCopiesNestedDeprecatedInstructionsFile(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	rel := filepath.Join("prompts", "unrestricted.md")
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(fmt.Sprintf("experimental_instructions_file = '%s'", rel)), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(sharedHome, "prompts"), 0o755); err != nil {
+		t.Fatalf("create shared prompts dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, rel), []byte("Nested."), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("prepareCodexHome failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexHome, rel))
+	if err != nil {
+		t.Fatalf("read per-task instructions: %v", err)
+	}
+	if string(data) != "Nested." {
+		t.Errorf("per-task instructions = %q", data)
+	}
+}
+
+// A missing source must fail while preparing the environment, with a diagnostic
+// naming the key and both paths — not as an opaque `os error 2` from Codex's own
+// configuration loading, after the task has already been launched.
+func TestPrepareCodexHomeReportsMissingModelInstructionsFile(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "missing-instructions.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	err := prepareCodexHome(codexHome, testLogger())
+	if err == nil {
+		t.Fatal("expected prepareCodexHome to fail for missing model instructions file")
+	}
+	for _, want := range []string{"model_instructions_file", "missing-instructions.md", filepath.Join(sharedHome, "missing-instructions.md")} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+// A relative reference that escapes the task home is rejected rather than
+// copied: honoring it would let any user config name an arbitrary host file and
+// have the daemon materialise it inside the task environment.
+func TestPrepareCodexHomeRejectsEscapingModelInstructionsFile(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	root := t.TempDir()
+	sharedHome := filepath.Join(root, "shared")
+	if err := os.MkdirAll(sharedHome, 0o755); err != nil {
+		t.Fatalf("create shared home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "../secrets.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "secrets.md"), []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write escaping source: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	err := prepareCodexHome(codexHome, testLogger())
+	if err == nil {
+		t.Fatal("expected prepareCodexHome to reject an escaping model instructions path")
+	}
+	if !strings.Contains(err.Error(), "model_instructions_file") {
+		t.Fatalf("error %q does not name the offending key", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(codexHome), "secrets.md")); !os.IsNotExist(statErr) {
+		t.Fatalf("escaping source was materialised outside the task home: %v", statErr)
+	}
+}
+
+// A reused task home must reflect the user's current instructions instead of
+// serving the snapshot an earlier run copied.
+func TestPrepareCodexHomeRefreshesModelInstructionsFileOnReuse(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "instructions-override.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	source := filepath.Join(sharedHome, "instructions-override.md")
+	if err := os.WriteFile(source, []byte("first"), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("first prepareCodexHome failed: %v", err)
+	}
+	if err := os.WriteFile(source, []byte("second"), 0o644); err != nil {
+		t.Fatalf("update shared instructions: %v", err)
+	}
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("second prepareCodexHome failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexHome, "instructions-override.md"))
+	if err != nil {
+		t.Fatalf("read per-task instructions: %v", err)
+	}
+	if string(data) != "second" {
+		t.Errorf("per-task instructions = %q, want the refreshed source", data)
+	}
+}
+
+// A reused task home is writable by the task that ran in it, so an intermediate
+// directory of the copy destination can be a symlink by the time the next
+// prepare runs. Root-scoped writes must refuse to follow it out of the task
+// home instead of deleting and overwriting the link target.
+func TestPrepareCodexHomeRefusesSymlinkedInstructionsParentOnReuse(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	rel := filepath.Join("prompts", "unrestricted.md")
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(fmt.Sprintf("model_instructions_file = '%s'", rel)), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(sharedHome, "prompts"), 0o755); err != nil {
+		t.Fatalf("create shared prompts dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, rel), []byte("from shared home"), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("first prepareCodexHome failed: %v", err)
+	}
+
+	// Stand in for what a task can do to its own home between prepares.
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "unrestricted.md")
+	if err := os.WriteFile(sentinel, []byte("outside the task home"), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	taskParent := filepath.Join(codexHome, "prompts")
+	if err := os.RemoveAll(taskParent); err != nil {
+		t.Fatalf("remove task prompts dir: %v", err)
+	}
+	if err := os.Symlink(outside, taskParent); err != nil {
+		t.Skipf("symlinks unsupported on this host: %v", err)
+	}
+
+	err := prepareCodexHome(codexHome, testLogger())
+	if err == nil {
+		t.Fatal("expected prepareCodexHome to refuse writing through a symlinked parent")
+	}
+	if !strings.Contains(err.Error(), "model_instructions_file") {
+		t.Fatalf("error %q does not name the offending key", err)
+	}
+
+	data, readErr := os.ReadFile(sentinel)
+	if readErr != nil {
+		t.Fatalf("sentinel outside the task home was removed: %v", readErr)
+	}
+	if string(data) != "outside the task home" {
+		t.Errorf("sentinel outside the task home was overwritten: %q", data)
+	}
+}
+
+// The destination file itself can also be a symlink on reuse. Removing it must
+// unlink the symlink, never write through it into the link target.
+func TestPrepareCodexHomeReplacesSymlinkedInstructionsCopyOnReuse(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "gpt-unrestricted.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "gpt-unrestricted.md"), []byte("from shared home"), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("first prepareCodexHome failed: %v", err)
+	}
+
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "sentinel.md")
+	if err := os.WriteFile(sentinel, []byte("outside the task home"), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	taskCopy := filepath.Join(codexHome, "gpt-unrestricted.md")
+	if err := os.Remove(taskCopy); err != nil {
+		t.Fatalf("remove task copy: %v", err)
+	}
+	if err := os.Symlink(sentinel, taskCopy); err != nil {
+		t.Skipf("symlinks unsupported on this host: %v", err)
+	}
+
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("second prepareCodexHome failed: %v", err)
+	}
+
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("sentinel outside the task home was removed: %v", err)
+	}
+	if string(data) != "outside the task home" {
+		t.Errorf("sentinel outside the task home was overwritten: %q", data)
+	}
+	info, err := os.Lstat(taskCopy)
+	if err != nil {
+		t.Fatalf("lstat task copy: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("task copy is still a symlink")
+	}
+	copied, err := os.ReadFile(taskCopy)
+	if err != nil {
+		t.Fatalf("read task copy: %v", err)
+	}
+	if string(copied) != "from shared home" {
+		t.Errorf("task copy = %q", copied)
+	}
+}
+
+// Repointing the key provisions the new target; the previous copy stays behind
+// unreferenced. Codex never reads it because the copied config no longer names
+// it — this test pins that documented contract so a future change to it is
+// deliberate.
+func TestPrepareCodexHomeLeavesRepointedInstructionsCopyBehind(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	sharedConfig := filepath.Join(sharedHome, "config.toml")
+	if err := os.WriteFile(sharedConfig, []byte(`model_instructions_file = "old.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "old.md"), []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("first prepareCodexHome failed: %v", err)
+	}
+
+	if err := os.WriteFile(sharedConfig, []byte(`model_instructions_file = "new.md"`), 0o644); err != nil {
+		t.Fatalf("repoint shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "new.md"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write new instructions: %v", err)
+	}
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("second prepareCodexHome failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexHome, "new.md"))
+	if err != nil {
+		t.Fatalf("read repointed instructions: %v", err)
+	}
+	if string(data) != "new" {
+		t.Errorf("repointed instructions = %q", data)
+	}
+	config, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read per-task config.toml: %v", err)
+	}
+	if !strings.Contains(string(config), `model_instructions_file = "new.md"`) {
+		t.Errorf("per-task config.toml still points at the old target: %s", config)
+	}
+	if _, err := os.Stat(filepath.Join(codexHome, "old.md")); err != nil {
+		t.Errorf("unreferenced old copy unexpectedly cleaned up: %v", err)
+	}
+}
+
+// The root of the copy — the task home itself — must be identity-checked too. A
+// path-based check followed by a path-based open leaves a window where the
+// directory is swapped for a link and every "confined" write lands in the wrong
+// tree. These two tests drive the check directly so the swap is deterministic
+// rather than raced.
+func TestVerifyCodexHomeRootRejectsSwappedDirectory(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	codexHome := filepath.Join(base, "codex-home")
+	if err := os.Mkdir(codexHome, 0o755); err != nil {
+		t.Fatalf("create codex home: %v", err)
+	}
+	root, err := os.OpenRoot(codexHome)
+	if err != nil {
+		t.Fatalf("open codex home root: %v", err)
+	}
+	defer root.Close()
+
+	// Same path, different directory — what a swap looks like after the open.
+	if err := os.Rename(codexHome, filepath.Join(base, "moved-aside")); err != nil {
+		t.Fatalf("move original codex home: %v", err)
+	}
+	if err := os.Mkdir(codexHome, 0o755); err != nil {
+		t.Fatalf("recreate codex home: %v", err)
+	}
+
+	err = verifyCodexHomeRoot(root, codexHome, "model_instructions_file")
+	if err == nil {
+		t.Fatal("expected verifyCodexHomeRoot to reject a swapped codex home")
+	}
+	if !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("error %q does not report the replacement", err)
+	}
+}
+
+func TestVerifyCodexHomeRootRejectsSymlinkedHome(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	codexHome := filepath.Join(base, "codex-home")
+	if err := os.Mkdir(codexHome, 0o755); err != nil {
+		t.Fatalf("create codex home: %v", err)
+	}
+	root, err := os.OpenRoot(codexHome)
+	if err != nil {
+		t.Fatalf("open codex home root: %v", err)
+	}
+	defer root.Close()
+
+	outside := t.TempDir()
+	if err := os.Rename(codexHome, filepath.Join(base, "moved-aside")); err != nil {
+		t.Fatalf("move original codex home: %v", err)
+	}
+	if err := os.Symlink(outside, codexHome); err != nil {
+		t.Skipf("symlinks unsupported on this host: %v", err)
+	}
+
+	err = verifyCodexHomeRoot(root, codexHome, "model_instructions_file")
+	if err == nil {
+		t.Fatal("expected verifyCodexHomeRoot to reject a symlinked codex home")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error %q does not report the symlink", err)
+	}
+}
+
+// End to end, scoped to the write this change owns: when the task home is
+// already a link to an outside directory, the referenced-file copy must fail
+// instead of provisioning through the link.
+//
+// Deliberately not asserted: that nothing at all lands in the link target.
+// Earlier steps in prepareCodexHomeWithOpts (config.toml, sessions/, plugin
+// cache) still address codexHome by path and run before this check, so making
+// the whole prepare root-handle safe is a separate, larger change (MUL-5647).
+func TestPrepareCodexHomeRefusesReferencedFileWriteThroughSymlinkedCodexHome(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sharedHome, "config.toml"), []byte(`model_instructions_file = "gpt-unrestricted.md"`), 0o644); err != nil {
+		t.Fatalf("write shared config.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "gpt-unrestricted.md"), []byte("from shared home"), 0o644); err != nil {
+		t.Fatalf("write shared instructions: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "gpt-unrestricted.md")
+	if err := os.WriteFile(sentinel, []byte("outside the task home"), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.Symlink(outside, codexHome); err != nil {
+		t.Skipf("symlinks unsupported on this host: %v", err)
+	}
+
+	err := prepareCodexHome(codexHome, testLogger())
+	if err == nil {
+		t.Fatal("expected prepareCodexHome to refuse a symlinked codex home")
+	}
+	if !strings.Contains(err.Error(), "model_instructions_file") {
+		t.Fatalf("error %q does not name the offending key", err)
+	}
+
+	data, readErr := os.ReadFile(sentinel)
+	if readErr != nil {
+		t.Fatalf("sentinel outside the task home was removed: %v", readErr)
+	}
+	if string(data) != "outside the task home" {
+		t.Errorf("sentinel outside the task home was overwritten: %q", data)
 	}
 }
 
@@ -2648,18 +3254,14 @@ func TestEnsureCodexSandboxConfigCreatesDefaultLinux(t *testing.T) {
 	if !strings.Contains(s, multicaManagedBeginMarker) || !strings.Contains(s, multicaManagedEndMarker) {
 		t.Errorf("missing managed block markers, got:\n%s", s)
 	}
-	if !strings.Contains(s, `sandbox_mode = "workspace-write"`) {
+	if !strings.Contains(s, `sandbox_mode = "danger-full-access"`) {
 		t.Error("missing sandbox_mode")
 	}
-	// The managed block uses TOML dotted-key form rather than a
-	// `[sandbox_workspace_write]` section header so it cannot leak into or
-	// inherit from any surrounding table scope. See upsertMulticaManagedBlock
-	// for why.
-	if strings.Contains(s, "[sandbox_workspace_write]") {
-		t.Errorf("managed block must not open a [sandbox_workspace_write] table header, got:\n%s", s)
-	}
-	if !strings.Contains(s, "sandbox_workspace_write.network_access = true") {
-		t.Errorf("missing dotted-key network_access = true, got:\n%s", s)
+	// Linux tasks run unsandboxed on the daemon user's real HOME, so nothing
+	// under sandbox_workspace_write applies — neither the table header nor the
+	// dotted-key form should be emitted (MUL-5578).
+	if strings.Contains(s, "sandbox_workspace_write") {
+		t.Errorf("must not emit any sandbox_workspace_write key under danger-full-access, got:\n%s", s)
 	}
 }
 
@@ -2795,8 +3397,8 @@ approval_policy = "on-failure"
 	if !strings.Contains(s, "approval_policy") {
 		t.Error("lost existing approval_policy")
 	}
-	if !strings.Contains(s, "network_access = true") {
-		t.Error("missing network_access = true")
+	if !strings.Contains(s, `sandbox_mode = "danger-full-access"`) {
+		t.Error("missing managed sandbox_mode")
 	}
 }
 
@@ -2951,14 +3553,16 @@ func TestCodexSandboxPolicyFor(t *testing.T) {
 		version  string
 		wantMode string
 		wantNet  bool
-		// wantHint is whether the policy carries an actionable upgrade hint.
-		// Only the macOS seatbelt fallback has one; the Windows compatibility
-		// fallback has no generic upgrade action, so it must not surface a
-		// misleading macOS hint.
+		// wantHint is whether the policy carries an actionable remediation hint.
+		// macOS points at a Codex upgrade and Linux at running the daemon inside
+		// an outer boundary; the Windows compatibility fallback has no generic
+		// action, so it must not surface a misleading macOS hint.
 		wantHint bool
 	}{
-		{"linux any version", "linux", "0.100.0", "workspace-write", true, false},
-		{"linux unknown version", "linux", "", "workspace-write", true, false},
+		// Linux runs unsandboxed by product decision, on any Codex version
+		// (MUL-5578) — there is no version-dependent branch to exercise here.
+		{"linux any version", "linux", "0.100.0", "danger-full-access", false, true},
+		{"linux unknown version", "linux", "", "danger-full-access", false, true},
 		{"windows any version", "windows", "0.144.5", "danger-full-access", false, false},
 		{"windows unknown version", "windows", "", "danger-full-access", false, false},
 		{"darwin old version", "darwin", "0.121.0", "danger-full-access", false, true},
@@ -2999,7 +3603,7 @@ func TestCodexSandboxPolicyForConfig(t *testing.T) {
 		{"windows undecidable fails closed", "windows", windowsSandboxUndecidable, "workspace-write", true},
 		{"windows absent falls back", "windows", windowsSandboxAbsent, "danger-full-access", false},
 		// Non-Windows platforms ignore winState entirely.
-		{"linux ignores winState", "linux", windowsSandboxNative, "workspace-write", true},
+		{"linux ignores winState", "linux", windowsSandboxNative, "danger-full-access", false},
 		{"darwin ignores winState", "darwin", windowsSandboxNative, "danger-full-access", false},
 	}
 	for _, tc := range cases {
@@ -3254,7 +3858,12 @@ func TestPrepareCodexHomeFailsClosedWhenSandboxWriteFails(t *testing.T) {
 	}
 }
 
-func TestPrepareCodexHomeEnsuresNetworkAccess(t *testing.T) {
+// TestPrepareCodexHomeWritesManagedSandboxBlock checks that preparing a codex
+// home wires the resolved policy all the way into config.toml. With an empty
+// shared home the resolved mode is danger-full-access on every platform — Linux
+// and macOS by their own defaults, Windows because no native windows.sandbox is
+// configured — so the expectation is host-independent.
+func TestPrepareCodexHomeWritesManagedSandboxBlock(t *testing.T) {
 	// Cannot use t.Parallel() with t.Setenv.
 
 	// Empty shared home — no config.toml to copy.
@@ -3262,22 +3871,25 @@ func TestPrepareCodexHomeEnsuresNetworkAccess(t *testing.T) {
 	t.Setenv("CODEX_HOME", sharedHome)
 
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
-	// Default prepareCodexHome assumes linux-like behavior.
 	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
 		t.Fatalf("prepareCodexHome failed: %v", err)
 	}
 
-	// config.toml should be created with network access defaults.
 	data, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
 	if err != nil {
 		t.Fatalf("config.toml not created: %v", err)
 	}
 	s := string(data)
-	if !strings.Contains(s, "network_access = true") {
-		t.Error("config.toml missing network_access = true")
+	if !strings.Contains(s, multicaManagedBeginMarker) {
+		t.Errorf("config.toml missing managed block, got:\n%s", s)
 	}
-	if !strings.Contains(s, `sandbox_mode = "workspace-write"`) {
-		t.Error("config.toml missing sandbox_mode")
+	if !strings.Contains(s, `sandbox_mode = "danger-full-access"`) {
+		t.Errorf("config.toml missing danger-full-access sandbox_mode, got:\n%s", s)
+	}
+	// Nothing under sandbox_workspace_write applies when the filesystem is not
+	// sandboxed; emitting it would imply containment that does not exist.
+	if strings.Contains(s, "sandbox_workspace_write") {
+		t.Errorf("config.toml must not emit sandbox_workspace_write under danger-full-access, got:\n%s", s)
 	}
 }
 
@@ -4730,7 +5342,7 @@ func TestInjectRuntimeConfigBriefKeepsStaticCatchUpRead(t *testing.T) {
 	}
 	s := string(data)
 
-	if !strings.Contains(s, "multica issue comment list "+issueID+" --recent 10 --output json") {
+	if !strings.Contains(s, "multica issue comment list "+issueID+" --roots-only --summary --output json") {
 		t.Errorf("brief must keep the static catch-up read\n---\n%s", s)
 	}
 	if strings.Contains(s, "--recent 20") {
@@ -4800,11 +5412,11 @@ func TestInjectRuntimeConfigBriefOmitsResumedThreadAnchor(t *testing.T) {
 	}
 }
 
-// TestInjectRuntimeConfigAssignmentTriggerMentionsRecent pins that the
+// TestInjectRuntimeConfigAssignmentTriggerScansRootsFirst pins that the
 // assignment-triggered Workflow keeps comment catch-up mandatory while bounding
-// the mandatory first read to the recent active-thread window. Older context
-// stays reachable through explicit pagination.
-func TestInjectRuntimeConfigAssignmentTriggerMentionsRecent(t *testing.T) {
+// the mandatory first read to a roots scan. Older context stays reachable
+// through explicit pagination.
+func TestInjectRuntimeConfigAssignmentTriggerScansRootsFirst(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -4820,17 +5432,20 @@ func TestInjectRuntimeConfigAssignmentTriggerMentionsRecent(t *testing.T) {
 	// Mandatory comment catch-up must stay, but the required first read is
 	// bounded to recent active threads instead of the full flat timeline.
 	for _, want := range []string{
-		"multica issue comment list issue-1 --recent 10 --output json",
+		"multica issue comment list issue-1 --roots-only --summary --output json",
 		"this is mandatory, not optional",
 		"Skipping this step is the most common cause",
 	} {
 		if !strings.Contains(s, want) {
-			t.Errorf("assignment Workflow regressed mandatory recent-first catch-up, missing %q\n---\n%s", want, s)
+			t.Errorf("assignment Workflow regressed mandatory scan-first catch-up, missing %q\n---\n%s", want, s)
 		}
 	}
-	// Older context must remain reachable through pagination.
+	// Older context must remain reachable through pagination. The cursor label
+	// and flags are documented in `## Available Commands` rather than restated
+	// inside the step (MUL-5372), so assert the label itself, not the literal
+	// `Next thread cursor: ...` stderr line the old step-3 copy quoted.
 	for _, want := range []string{
-		"Next thread cursor:",
+		"Next thread cursor",
 		"--before",
 		"--before-id",
 	} {
@@ -4854,6 +5469,69 @@ func TestInjectRuntimeConfigAssignmentTriggerMentionsRecent(t *testing.T) {
 	} {
 		if strings.Contains(s, banned) {
 			t.Errorf("assignment Workflow regressed to replacement-style --recent phrasing %q\n---\n%s", banned, s)
+		}
+	}
+}
+
+// TestInjectRuntimeConfigCatchUpScansRootsFirst locks in MUL-5372: the
+// mandatory step-3 catch-up leads with a bounded `--roots-only --summary` scan
+// and an explicit per-thread drill-down, instead of making `--recent 10` the
+// required first read. `--recent N` caps threads, not comments — it returns every
+// descendant of each thread — so as the mandatory read it handed every run the
+// issue's entire comment history, and duplicated the bounded thread read the
+// per-turn message already points at on comment-triggered turns.
+//
+// It also pins the placement rule: the workflow step names only the reads it
+// mandates, while flag semantics (including the saturation trap) live once in
+// `## Available Commands`. Restating them per step is what bloated the step.
+func TestInjectRuntimeConfigCatchUpScansRootsFirst(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if _, err := InjectRuntimeConfig(dir, "claude", TaskContextForEnv{IssueID: "issue-1"}); err != nil {
+		t.Fatalf("InjectRuntimeConfig failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("read CLAUDE.md: %v", err)
+	}
+	s := string(data)
+
+	for _, want := range []string{
+		// The cheap scan is the first thing step 3 asks for.
+		"multica issue comment list issue-1 --roots-only --summary --output json",
+		// ...followed by an explicit, bounded drill-down.
+		"multica issue comment list issue-1 --thread <thread-id> --tail 30 --output json",
+		// The saturation semantics that made --recent 10 misleading are stated
+		// once, in the flag reference rather than in the step.
+		"caps THREADS, not comments",
+		"no per-thread cap",
+		"fewer than N root threads",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("brief missing bounded catch-up guidance %q\n---\n%s", want, s)
+		}
+	}
+
+	// The workflow steps must not hand the agent a ready-to-paste bulk read;
+	// that is what made the mandatory step pull whole histories.
+	if strings.Contains(s, "multica issue comment list issue-1 --recent") {
+		t.Errorf("workflow steps must not present an issue-scoped --recent command\n---\n%s", s)
+	}
+	// The saturation warning belongs to the flag reference, which introduces
+	// the flag generically as `--recent N`.
+	if !strings.Contains(s, "--recent N") {
+		t.Errorf("Available Commands must still document --recent N\n---\n%s", s)
+	}
+
+	// The catch-up stays mandatory — this change is about payload shape, not
+	// about letting agents skip context and act on stale instructions.
+	for _, want := range []string{
+		"this is mandatory, not optional",
+		"Skipping this step is the most common cause",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("step 3 must stay mandatory, missing %q\n---\n%s", want, s)
 		}
 	}
 }

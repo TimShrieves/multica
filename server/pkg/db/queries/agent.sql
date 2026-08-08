@@ -38,6 +38,20 @@ FOR UPDATE;
 SELECT * FROM agent
 WHERE id = $1 AND workspace_id = $2 AND kind = 'user';
 
+-- name: LockAgentForAutopilotAssignment :one
+-- Serializes creating, retargeting, or resuming an active Autopilot with
+-- Runtime teardown. Teardown takes FOR UPDATE on this same Agent row before it
+-- clears runtime_id and pauses matching Autopilots. FOR SHARE also stabilizes
+-- runtime_id and archived_at against concurrent ordinary Agent updates. The
+-- shared lock makes the
+-- two outcomes exhaustive:
+--   * assignment commits first, then teardown sees and pauses it; or
+--   * teardown commits first, then assignment re-reads runtime_id=NULL and
+--     rejects the active Autopilot.
+SELECT * FROM agent
+WHERE id = $1 AND workspace_id = $2 AND kind = 'user'
+FOR SHARE;
+
 -- name: CreateAgent :one
 INSERT INTO agent (
     workspace_id, name, description, avatar_url, runtime_mode,
@@ -214,7 +228,7 @@ RETURNING *;
 -- Returns every non-archived agent bound to a runtime. Backs the cascade
 -- delete dialog: when DELETE /api/runtimes/:id refuses with
 -- runtime_has_active_agents, the response carries this list so the front-end
--- can render exactly the agents that will be archived if the user confirms,
+-- can render exactly the agents that will be unbound if the user confirms,
 -- and so the cascade endpoint's expected_active_agent_ids check has a stable
 -- snapshot to compare against. Ordered by name for a deterministic display.
 SELECT * FROM agent
@@ -228,11 +242,21 @@ ORDER BY name ASC;
 -- LockAgentRuntime, which holds the runtime row exclusively to also
 -- block FK-validated INSERTs / runtime_id updates that would otherwise
 -- add a new agent to the runtime mid-cascade. Together they guarantee
--- that the set we compared against expected_active_agent_ids is exactly
--- the set ArchiveAgentsByIDs will operate on — no race window.
+-- that the set we compared against expected_active_agent_ids is stable.
 SELECT * FROM agent
 WHERE runtime_id = $1 AND archived_at IS NULL AND kind = 'user'
 ORDER BY name ASC
+FOR UPDATE;
+
+-- name: ListUserAgentsByRuntimeForUpdate :many
+-- Locks active AND archived user agents before a runtime teardown. Locking only
+-- the active snapshot leaves a restore race: an archived row can become active
+-- after confirmation and then be silently unbound. Runtime/profile delete
+-- locks the parent runtime first (blocking new FK references), then calls this
+-- in stable ID order (blocking restore/archive/move on existing rows).
+SELECT * FROM agent
+WHERE runtime_id = $1 AND kind = 'user'
+ORDER BY id
 FOR UPDATE;
 
 -- name: RestoreAgent :one
@@ -685,11 +709,18 @@ RETURNING *;
 -- session_id NULL and flagging the row happen in THIS terminal transaction so an
 -- auto-retry created and woken by the same commit can never observe the bad
 -- pointer or a missing gap flag.
+--
+-- retired_session_id (GH #6066): a session this run abandoned as unresumable.
+-- Recorded even on the completed path, because that is exactly the case the
+-- resume lookups could not see — a fresh-session retry that SUCCEEDS still has
+-- to retire the transcript it retried away from, or an older completed row
+-- pointing at the same id resurrects it on the next run.
 UPDATE agent_task_queue
 SET status = 'completed', completed_at = now(), result = $2,
     session_id = CASE WHEN sqlc.arg('session_rollout_missing') THEN NULL ELSE $3 END,
     work_dir = $4,
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
+    retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
 WHERE id = $1 AND status = 'running'
 RETURNING *;
@@ -758,24 +789,51 @@ RETURNING *;
 -- resuming the poisoned session. Both markers are required so the clause stays
 -- exactly as narrow as classifyPoisonedError and the Kiro detector — an
 -- unrelated error that only mentions image dimensions is NOT excluded.
-WITH latest_per_session AS (
-    SELECT DISTINCT ON (session_id)
-        session_id, work_dir, runtime_id, status, failure_reason, error,
-        COALESCE(completed_at, started_at, dispatched_at, created_at) AS terminal_at
-    FROM agent_task_queue
-    WHERE agent_id = $1 AND issue_id = $2
-      AND session_id IS NOT NULL
-      AND status IN ('completed', 'failed')
-    ORDER BY session_id, COALESCE(completed_at, started_at, dispatched_at, created_at) DESC
+--
+-- The final pair of regexes is the provider-agnostic version of the same
+-- guard, and it matters most for self-hosted installs: daemons upgrade on
+-- their own cadence, so a host still running a daemon without
+-- taskfailure.UnresumableHistory reports an empty-message rejection as
+-- agent_error.unknown and would otherwise keep resuming the transcript the
+-- provider just refused (GH #6066). Both regexes must match — an emptiness
+-- complaint AND a locator pointing into the message history — mirroring
+-- emptyContentRe and historyMessageLocatorRe in pkg/taskfailure/resume.go.
+-- Keep the three in sync.
+--
+-- retired_sessions is the explicit half of the same rule (GH #6066). The
+-- per-session latest state above can only judge sessions that some row still
+-- POINTS at, so it cannot see a session a run deliberately abandoned: a fresh
+-- retry that succeeded reports its own new id (or none), leaving the poisoned
+-- id visible on nothing but an older completed row, which then looks perfectly
+-- healthy. retired_session_id records the abandonment itself, so one row
+-- retiring a session removes it from every later lookup no matter how many
+-- clean rows still reference it.
+WITH retired_sessions AS (
+    SELECT DISTINCT r.retired_session_id AS session_id
+    FROM agent_task_queue r
+    WHERE r.agent_id = $1 AND r.issue_id = $2
+      AND r.retired_session_id IS NOT NULL
+), latest_per_session AS (
+    SELECT DISTINCT ON (t.session_id)
+        t.session_id, t.work_dir, t.runtime_id, t.status, t.failure_reason, t.error,
+        COALESCE(t.completed_at, t.started_at, t.dispatched_at, t.created_at) AS terminal_at
+    FROM agent_task_queue t
+    WHERE t.agent_id = $1 AND t.issue_id = $2
+      AND t.session_id IS NOT NULL
+      AND t.status IN ('completed', 'failed')
+    ORDER BY t.session_id, COALESCE(t.completed_at, t.started_at, t.dispatched_at, t.created_at) DESC
 )
 SELECT session_id, work_dir, runtime_id FROM latest_per_session
-WHERE (
+WHERE session_id NOT IN (SELECT session_id FROM retired_sessions)
+  AND (
     status = 'completed'
     OR (
       status = 'failed'
       AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow')
       AND NOT (COALESCE(error, '') ILIKE '%400%' AND COALESCE(error, '') ILIKE '%invalid_request_error%')
       AND NOT (COALESCE(error, '') ILIKE '%image dimensions exceed max allowed size%' AND COALESCE(error, '') ILIKE '%image.source.base64.data%')
+      AND NOT (COALESCE(error, '') ~* 'must not be empty|must be non-?empty|must have non-?empty|non-?empty content|cannot be empty|should not be empty'
+               AND COALESCE(error, '') ~* 'role[^a-z0-9]{0,2}assistant|assistant message|message at position|messages\.[0-9]|messages\[[0-9]')
     )
   )
 ORDER BY terminal_at DESC
@@ -843,6 +901,7 @@ SET status = 'failed',
     session_id = CASE WHEN sqlc.arg('session_rollout_missing') THEN NULL ELSE COALESCE(sqlc.narg('session_id'), session_id) END,
     work_dir = COALESCE(sqlc.narg('work_dir'), work_dir),
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
+    retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
 WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
 RETURNING *;
