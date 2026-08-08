@@ -16,6 +16,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/integrations/strikeflowresponse"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -325,6 +326,17 @@ func main() {
 	defer analyticsClient.Close()
 
 	queries := db.New(pool)
+	strikeFlowResponseConfig, err := strikeflowresponse.ConfigFromEnv()
+	if err != nil {
+		slog.Error("invalid dormant StrikeFlow response publisher configuration", "error", err)
+		os.Exit(1)
+	}
+	strikeFlowResponsePublisher, err := strikeflowresponse.New(pool, strikeFlowResponseConfig)
+	if err != nil {
+		slog.Error("unable to construct StrikeFlow response publisher", "error", err)
+		os.Exit(1)
+	}
+	strikeflowresponse.Register(bus, strikeFlowResponsePublisher)
 	hub.SetAuthorizer(newScopeAuthorizer(queries))
 	// Order matters: subscriber listeners must register BEFORE notification listeners.
 	// The notification listener queries the subscriber table to determine recipients,
@@ -427,6 +439,9 @@ func main() {
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	go runDBStatsLogger(sweepCtx, pool)
+	if strikeFlowResponsePublisher != nil {
+		go strikeFlowResponsePublisher.Run(sweepCtx)
+	}
 	if h.WebhookDeliveryWorker != nil {
 		go h.WebhookDeliveryWorker.Run(sweepCtx)
 	}

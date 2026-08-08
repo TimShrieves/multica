@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_strikeflow_response_outbox_event_unique ON strikeflow_response_outbox (event_type, continuation_task_id, COALESCE(agent_comment_id, '00000000-0000-0000-0000-000000000000'::uuid));
