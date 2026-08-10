@@ -752,8 +752,9 @@ func (h *Handler) mutateStrikeFlowInbox(w http.ResponseWriter, r *http.Request, 
 }
 
 type strikeFlowReplyRequest struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	Message        string `json:"message"`
+	IdempotencyKey      string `json:"idempotency_key"`
+	Message             string `json:"message"`
+	StrikeFlowCommandID string `json:"strikeflow_command_id"`
 }
 
 func validStrikeFlowReply(message string) bool {
@@ -771,15 +772,20 @@ func validStrikeFlowReply(message string) bool {
 func strikeFlowReplyPayloadHash(
 	tokenID string,
 	itemID, issueID, rootCommentID pgtype.UUID,
+	strikeFlowCommandID pgtype.UUID,
 	message string,
 ) string {
-	hashInput := strings.Join([]string{
+	hashParts := []string{
 		tokenID,
 		util.UUIDToString(itemID),
 		util.UUIDToString(issueID),
 		util.UUIDToString(rootCommentID),
-		message,
-	}, "\x00")
+	}
+	if strikeFlowCommandID.Valid {
+		hashParts = append(hashParts, util.UUIDToString(strikeFlowCommandID))
+	}
+	hashParts = append(hashParts, message)
+	hashInput := strings.Join(hashParts, "\x00")
 	sum := sha256.Sum256([]byte(hashInput))
 	return hex.EncodeToString(sum[:])
 }
@@ -803,6 +809,14 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "idempotency_key must be a UUID")
 		return
 	}
+	var strikeFlowCommandID pgtype.UUID
+	if req.StrikeFlowCommandID != "" {
+		strikeFlowCommandID, err = util.ParseUUID(req.StrikeFlowCommandID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "strikeflow_command_id must be a UUID")
+			return
+		}
+	}
 	message := strings.TrimSpace(req.Message)
 
 	// A committed receipt is the durable authorization result of the original
@@ -815,14 +829,14 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	var replayItem strikeFlowBoundItem
 	var replayHash string
-	var replayCommentID pgtype.UUID
+	var replayCommentID, replayCommandID pgtype.UUID
 	err = replayTx.QueryRow(r.Context(), `
-		SELECT inbox_item_id,issue_id,root_comment_id,payload_hash,comment_id
+		SELECT inbox_item_id,issue_id,root_comment_id,strikeflow_command_id,payload_hash,comment_id
 		FROM strikeflow_connector_reply_receipt
 		WHERE token_id=$1 AND idempotency_key=$2 AND comment_id IS NOT NULL
 		FOR SHARE
 	`, scope.TokenID, key).Scan(
-		&replayItem.ItemID, &replayItem.IssueID, &replayItem.RootCommentID,
+		&replayItem.ItemID, &replayItem.IssueID, &replayItem.RootCommentID, &replayCommandID,
 		&replayHash, &replayCommentID,
 	)
 	if err == nil {
@@ -831,9 +845,10 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 			replayItem.ItemID,
 			replayItem.IssueID,
 			replayItem.RootCommentID,
+			strikeFlowCommandID,
 			message,
 		)
-		if replayItem.ItemID != itemID || replayHash != expectedHash {
+		if replayItem.ItemID != itemID || replayCommandID != strikeFlowCommandID || replayHash != expectedHash {
 			_ = replayTx.Rollback(r.Context())
 			writeError(w, http.StatusConflict, "idempotency key conflict")
 			return
@@ -885,32 +900,33 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	item = lockedItem
 	payloadHash := strikeFlowReplyPayloadHash(
-		scope.TokenID, item.ItemID, item.IssueID, item.RootCommentID, message,
+		scope.TokenID, item.ItemID, item.IssueID, item.RootCommentID, strikeFlowCommandID, message,
 	)
 	qtx := h.Queries.WithTx(tx)
 	tag, err := tx.Exec(r.Context(), `
 			INSERT INTO strikeflow_connector_reply_receipt
-				(token_id,idempotency_key,inbox_item_id,issue_id,root_comment_id,payload_hash)
-			VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING
-	`, scope.TokenID, key, item.ItemID, item.IssueID, item.RootCommentID, payloadHash)
+				(token_id,idempotency_key,inbox_item_id,issue_id,root_comment_id,payload_hash,strikeflow_command_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING
+	`, scope.TokenID, key, item.ItemID, item.IssueID, item.RootCommentID, payloadHash, strikeFlowCommandID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to reserve connector reply")
 		return
 	}
 	var storedHash string
-	var storedItemID, storedIssueID, storedRootID, commentID pgtype.UUID
+	var storedItemID, storedIssueID, storedRootID, storedCommandID, commentID pgtype.UUID
 	var createdAt time.Time
 	if err := tx.QueryRow(r.Context(), `
-			SELECT inbox_item_id,issue_id,root_comment_id,payload_hash,comment_id,created_at
+			SELECT inbox_item_id,issue_id,root_comment_id,strikeflow_command_id,payload_hash,comment_id,created_at
 			FROM strikeflow_connector_reply_receipt
 			WHERE token_id=$1 AND idempotency_key=$2
 	`, scope.TokenID, key).Scan(
-		&storedItemID, &storedIssueID, &storedRootID, &storedHash, &commentID, &createdAt,
+		&storedItemID, &storedIssueID, &storedRootID, &storedCommandID, &storedHash, &commentID, &createdAt,
 	); err != nil ||
 		storedHash != payloadHash ||
 		storedItemID != item.ItemID ||
 		storedIssueID != item.IssueID ||
-		storedRootID != item.RootCommentID {
+		storedRootID != item.RootCommentID ||
+		storedCommandID != strikeFlowCommandID {
 		writeError(w, http.StatusConflict, "idempotency key conflict")
 		return
 	}

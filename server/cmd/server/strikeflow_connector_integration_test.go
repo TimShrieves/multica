@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/integrations/strikeflowresponse"
 	"github.com/multica-ai/multica/server/internal/realtime"
 )
 
@@ -1201,7 +1203,7 @@ func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {
 
 	key := "00000000-0000-4000-8000-000000000097"
 	resp := strikeFlowRequest(t, f.valid, http.MethodPost, base+"/replies",
-		map[string]any{"idempotency_key": key, "message": "Audit must commit with this reply."})
+		map[string]any{"idempotency_key": key, "strikeflow_command_id": "10000000-0000-4000-8000-000000000001", "message": "Audit must commit with this reply."})
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("reply audit failure = %d, want 500", resp.StatusCode)
 	}
@@ -1249,7 +1251,7 @@ func TestStrikeFlowConnectorMutationAuditFailureRollsBack(t *testing.T) {
 
 	dropConstraint()
 	resp = strikeFlowRequest(t, f.valid, http.MethodPost, base+"/replies",
-		map[string]any{"idempotency_key": key, "message": "Audit must commit with this reply."})
+		map[string]any{"idempotency_key": key, "strikeflow_command_id": "10000000-0000-4000-8000-000000000001", "message": "Audit must commit with this reply."})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("retry after audit recovery = %d, want 201", resp.StatusCode)
 	}
@@ -1300,7 +1302,7 @@ func TestStrikeFlowConnectorSecurityBoundary(t *testing.T) {
 		resp.Body.Close()
 	}
 	resp = strikeFlowRequest(t, f.readOnly, http.MethodPost, base+"/inbox/"+f.itemID+"/replies",
-		map[string]any{"idempotency_key": "00000000-0000-4000-8000-000000000099", "message": "No"})
+		map[string]any{"idempotency_key": "00000000-0000-4000-8000-000000000099", "strikeflow_command_id": "10000000-0000-4000-8000-000000000099", "message": "No"})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("missing reply scope = %d", resp.StatusCode)
 	}
@@ -1745,7 +1747,7 @@ func TestStrikeFlowConnectorReplyIdempotency(t *testing.T) {
 	f := seedStrikeFlowIntegrationFixture(t)
 	path := "/api/integrations/strikeflow/inbox/" + f.itemID + "/replies"
 	key := "00000000-0000-4000-8000-000000000098"
-	body := map[string]any{"idempotency_key": key, "message": "Please revise this."}
+	body := map[string]any{"idempotency_key": key, "strikeflow_command_id": "10000000-0000-4000-8000-000000000002", "message": "Please revise this."}
 
 	resp := strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
 	if resp.StatusCode != http.StatusCreated {
@@ -1753,6 +1755,13 @@ func TestStrikeFlowConnectorReplyIdempotency(t *testing.T) {
 	}
 	var first map[string]any
 	readJSON(t, resp, &first)
+	var storedCommandID string
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT strikeflow_command_id::text FROM strikeflow_connector_reply_receipt
+		WHERE idempotency_key=$1
+	`, key).Scan(&storedCommandID); err != nil || storedCommandID != body["strikeflow_command_id"] {
+		t.Fatalf("immutable command binding = %q err=%v", storedCommandID, err)
+	}
 	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("replay = %d", resp.StatusCode)
@@ -1768,4 +1777,409 @@ func TestStrikeFlowConnectorReplyIdempotency(t *testing.T) {
 		t.Fatalf("conflicting replay = %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+func TestStrikeFlowConnectorLegacyReplyHashReplayAndPublisherExclusion(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	path := "/api/integrations/strikeflow/inbox/" + f.itemID + "/replies"
+	key := "00000000-0000-4000-8000-000000000097"
+	message := "Legacy reply remains unchanged."
+	resp := strikeFlowRequest(t, f.valid, http.MethodPost, path,
+		map[string]any{"idempotency_key": key, "message": message})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("legacy reply = %d", resp.StatusCode)
+	}
+	var first map[string]any
+	readJSON(t, resp, &first)
+	var tokenID, storedHash string
+	var commandIsNull bool
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT token_id::text,payload_hash,strikeflow_command_id IS NULL
+		FROM strikeflow_connector_reply_receipt WHERE idempotency_key=$1
+	`, key).Scan(&tokenID, &storedHash, &commandIsNull); err != nil {
+		t.Fatal(err)
+	}
+	legacyHashInput := strings.Join([]string{tokenID, f.itemID, f.issueID, f.rootID, message}, "\x00")
+	wantHashBytes := sha256.Sum256([]byte(legacyHashInput))
+	if wantHash := hex.EncodeToString(wantHashBytes[:]); !commandIsNull || storedHash != wantHash {
+		t.Fatalf("legacy binding/hash changed: null=%v hash=%s want=%s", commandIsNull, storedHash, wantHash)
+	}
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path,
+		map[string]any{"idempotency_key": key, "message": message})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy replay = %d", resp.StatusCode)
+	}
+	var replay map[string]any
+	readJSON(t, resp, &replay)
+	if replay["comment_id"] != first["comment_id"] || replay["replayed"] != true {
+		t.Fatalf("legacy replay changed: first=%v replay=%v", first, replay)
+	}
+	resp = strikeFlowRequest(t, f.valid, http.MethodPost, path, map[string]any{
+		"idempotency_key": key, "strikeflow_command_id": "10000000-0000-4000-8000-000000000003", "message": message,
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("legacy key rebound to command = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	taskID, _ := first["task_id"].(string)
+	commentID, _ := first["comment_id"].(string)
+	var agentID string
+	if taskID == "" || commentID == "" || testPool.QueryRow(t.Context(), `SELECT agent_id::text FROM agent_task_queue WHERE id=$1`, taskID).Scan(&agentID) != nil {
+		t.Fatalf("legacy continuation receipt incomplete: %v", first)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type,parent_id,source_task_id)
+		VALUES($1,$2,'agent',$3,'Legacy response','comment',$4,$5)
+	`, f.issueID, testWorkspaceID, agentID, commentID, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{"10000000-0000-4000-8000-000000000099"},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("legacy exclusion recovery failed: %v", err)
+	}
+	var outboxCount int
+	if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM strikeflow_response_outbox WHERE continuation_task_id=$1`, taskID).Scan(&outboxCount); err != nil || outboxCount != 0 {
+		t.Fatalf("legacy receipt entered response outbox: count=%d err=%v", outboxCount, err)
+	}
+}
+
+func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	path := "/api/integrations/strikeflow/inbox/" + f.itemID + "/replies"
+	commandID := "10000000-0000-4000-8000-000000000005"
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM strikeflow_response_outbox WHERE strikeflow_command_id=$1`, commandID)
+	})
+	resp := strikeFlowRequest(t, f.valid, http.MethodPost, path, map[string]any{
+		"idempotency_key":       "00000000-0000-4000-8000-000000000096",
+		"strikeflow_command_id": commandID,
+		"message":               "Create an exact-bound continuation.",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("bound reply = %d", resp.StatusCode)
+	}
+	var receipt map[string]any
+	readJSON(t, resp, &receipt)
+	commentID, _ := receipt["comment_id"].(string)
+	taskID, _ := receipt["task_id"].(string)
+	if commentID == "" || taskID == "" {
+		t.Fatalf("missing connector continuation binding: %v", receipt)
+	}
+	var agentID string
+	if err := testPool.QueryRow(t.Context(), `SELECT agent_id::text FROM agent_task_queue WHERE id=$1`, taskID).Scan(&agentID); err != nil {
+		t.Fatal(err)
+	}
+	var agentCommentID string
+	if err := testPool.QueryRow(t.Context(), `
+		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type,parent_id,source_task_id)
+		VALUES($1,$2,'agent',$3,'Exact response','comment',$4,$5) RETURNING id
+	`, f.issueID, testWorkspaceID, agentID, commentID, taskID).Scan(&agentCommentID); err != nil {
+		t.Fatal(err)
+	}
+	var chainedAgentCommentID string
+	if err := testPool.QueryRow(t.Context(), `
+		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type,parent_id,source_task_id)
+		VALUES($1,$2,'agent',$3,'Chained exact response','comment',$4,$5) RETURNING id
+	`, f.issueID, testWorkspaceID, agentID, agentCommentID, taskID).Scan(&chainedAgentCommentID); err != nil {
+		t.Fatal(err)
+	}
+	var humanIntermediateID, invalidAgentCommentID string
+	if err := testPool.QueryRow(t.Context(), `
+		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type,parent_id)
+		VALUES($1,$2,'member',$3,'Human intermediate','comment',$4) RETURNING id
+	`, f.issueID, testWorkspaceID, testUserID, chainedAgentCommentID).Scan(&humanIntermediateID); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type,parent_id,source_task_id)
+		VALUES($1,$2,'agent',$3,'Invalid response lineage','comment',$4,$5) RETURNING id
+	`, f.issueID, testWorkspaceID, agentID, humanIntermediateID, taskID).Scan(&invalidAgentCommentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1
+	`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	excludedPublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: f.issueID,
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := excludedPublisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var excludedCount int
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox WHERE strikeflow_command_id=$1
+	`, commandID).Scan(&excludedCount); err != nil || excludedCount != 0 {
+		t.Fatalf("STR-94-excluded outbox rows = %d err=%v", excludedCount, err)
+	}
+	futurePublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := futurePublisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox WHERE strikeflow_command_id=$1
+	`, commandID).Scan(&excludedCount); err != nil || excludedCount != 0 {
+		t.Fatalf("pre-activation response entered outbox: count=%d err=%v", excludedCount, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET trigger_evidence_kind='issue_assignment' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	provenancePublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provenancePublisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox WHERE strikeflow_command_id=$1
+	`, commandID).Scan(&excludedCount); err != nil || excludedCount != 0 {
+		t.Fatalf("wrong task provenance entered outbox: count=%d err=%v", excludedCount, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET trigger_evidence_kind='comment' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox
+		WHERE strikeflow_command_id=$1 AND member_comment_id=$2 AND continuation_task_id=$3
+		  AND (event_type='task.completed' OR agent_comment_id=ANY($4::uuid[]))
+	`, commandID, commentID, taskID, []string{agentCommentID, chainedAgentCommentID}).Scan(&count); err != nil || count != 3 {
+		t.Fatalf("exact response outbox rows = %d err=%v", count, err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox WHERE agent_comment_id=$1
+	`, invalidAgentCommentID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("human-intermediate response entered outbox: count=%d err=%v", count, err)
+	}
+	parentFailure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer parentFailure.Close()
+	blockedPublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: parentFailure.URL + "/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		HTTPClient: parentFailure.Client(), NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := blockedPublisher.DeliverOnce(t.Context()); err != nil || !processed {
+		t.Fatalf("parent transient failure: processed=%v err=%v", processed, err)
+	}
+	if processed, err := blockedPublisher.DeliverOnce(t.Context()); err != nil || processed {
+		t.Fatalf("child or completion overtook failed parent: processed=%v err=%v", processed, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE strikeflow_response_outbox SET next_attempt_at=now()
+		WHERE strikeflow_command_id=$1 AND agent_comment_id=$2
+	`, commandID, agentCommentID); err != nil {
+		t.Fatal(err)
+	}
+	type deliveredEvent struct {
+		eventType string
+		commentID string
+		err       string
+	}
+	deliveries := make(chan deliveredEvent, 3)
+	webhook := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, readErr := io.ReadAll(r.Body)
+		observation := deliveredEvent{}
+		if readErr != nil {
+			observation.err = readErr.Error()
+		} else {
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				observation.err = err.Error()
+			}
+			observation.eventType, _ = body["event_type"].(string)
+			observation.commentID, _ = body["comment_id"].(string)
+			timestamp := r.Header.Get("X-Multica-Timestamp")
+			wantSignature := "sha256=" + strikeflowresponse.Sign(
+				"0123456789abcdef0123456789abcdef", timestamp, raw,
+			)
+			if r.URL.Path != "/api/integrations/multica/content-delivery/responses" ||
+				r.Header.Get("X-Multica-Key-Id") != "test-v1" ||
+				r.Header.Get("X-Multica-Signature") != wantSignature ||
+				r.Header.Get("X-Multica-Event-Id") == "" {
+				observation.err = "webhook route or authentication headers did not match"
+			}
+		}
+		deliveries <- observation
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":   true,
+			"data": map[string]any{"event_id": r.Header.Get("X-Multica-Event-Id")},
+		})
+	}))
+	defer webhook.Close()
+	publisher, err = strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: webhook.URL + "/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		HTTPClient: webhook.Client(), Now: func() time.Time { return time.Unix(1786172400, 0) },
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenTypes := map[string]bool{}
+	deliveryOrder := make([]deliveredEvent, 0, 3)
+	for range 3 {
+		processed, err := publisher.DeliverOnce(t.Context())
+		if err != nil || !processed {
+			t.Fatalf("deliver response event: processed=%v err=%v", processed, err)
+		}
+		observation := <-deliveries
+		if observation.err != "" {
+			t.Fatal(observation.err)
+		}
+		seenTypes[observation.eventType] = true
+		deliveryOrder = append(deliveryOrder, observation)
+	}
+	if !seenTypes["agent_comment.created"] || !seenTypes["task.completed"] {
+		t.Fatalf("delivered event types = %v", seenTypes)
+	}
+	if len(deliveryOrder) != 3 ||
+		deliveryOrder[0].commentID != agentCommentID ||
+		deliveryOrder[1].commentID != chainedAgentCommentID ||
+		deliveryOrder[2].eventType != "task.completed" {
+		t.Fatalf("response delivery order = %+v", deliveryOrder)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox
+		WHERE strikeflow_command_id=$1 AND delivered_at IS NOT NULL
+	`, commandID).Scan(&count); err != nil || count != 3 {
+		t.Fatalf("delivered outbox rows = %d err=%v", count, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE strikeflow_response_outbox
+		SET delivered_at=NULL,attempt_count=11,next_attempt_at=now(),needs_attention_at=NULL
+		WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+	`, commandID); err != nil {
+		t.Fatal(err)
+	}
+	failingWebhook := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failingWebhook.Close()
+	retryPublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: failingWebhook.URL + "/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		CommandIDs:  []string{commandID},
+		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		HTTPClient: failingWebhook.Client(), NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := retryPublisher.DeliverOnce(t.Context()); err != nil || !processed {
+		t.Fatalf("attention transition delivery: processed=%v err=%v", processed, err)
+	}
+	var attempts int
+	var attentionAt time.Time
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT attempt_count,needs_attention_at
+		FROM strikeflow_response_outbox
+		WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+	`, commandID).Scan(&attempts, &attentionAt); err != nil || attempts != 12 || attentionAt.IsZero() {
+		t.Fatalf("needs-attention state: attempts=%d attention=%v err=%v", attempts, attentionAt, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE strikeflow_response_outbox SET next_attempt_at=now()
+		WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+	`, commandID); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := publisher.DeliverOnce(t.Context()); err != nil || processed {
+		t.Fatalf("attention row was automatically retried: processed=%v err=%v", processed, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE strikeflow_response_outbox
+		SET needs_attention_at=NULL,attempt_count=0,next_attempt_at=now()
+		WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+	`, commandID); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := publisher.DeliverOnce(t.Context()); err != nil || !processed {
+		t.Fatalf("operator-reset attention delivery: processed=%v err=%v", processed, err)
+	}
+	if observation := <-deliveries; observation.err != "" || observation.eventType != "task.completed" {
+		t.Fatalf("attention recovery webhook = %+v", observation)
+	}
+	var attentionCleared, delivered bool
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT needs_attention_at IS NULL,delivered_at IS NOT NULL
+		FROM strikeflow_response_outbox
+		WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+	`, commandID).Scan(&attentionCleared, &delivered); err != nil || !attentionCleared || !delivered {
+		t.Fatalf("attention recovery not cleared: cleared=%v delivered=%v err=%v", attentionCleared, delivered, err)
+	}
+	if _, err := testPool.Exec(t.Context(), `
+		UPDATE strikeflow_connector_reply_receipt
+		SET strikeflow_command_id='10000000-0000-4000-8000-000000000006'
+		WHERE strikeflow_command_id=$1
+	`, commandID); err == nil {
+		t.Fatal("immutable command binding accepted an update")
+	}
 }

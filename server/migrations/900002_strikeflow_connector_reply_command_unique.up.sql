@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_strikeflow_connector_reply_command_unique ON strikeflow_connector_reply_receipt (strikeflow_command_id) WHERE strikeflow_command_id IS NOT NULL;
