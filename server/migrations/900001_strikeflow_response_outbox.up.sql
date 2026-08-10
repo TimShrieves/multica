@@ -1,5 +1,5 @@
 ALTER TABLE strikeflow_connector_reply_receipt
-    ADD COLUMN strikeflow_command_id UUID;
+    ADD COLUMN IF NOT EXISTS strikeflow_command_id UUID;
 
 CREATE OR REPLACE FUNCTION reject_strikeflow_reply_command_binding_change()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -11,6 +11,8 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS strikeflow_reply_command_binding_immutable
+    ON strikeflow_connector_reply_receipt;
 CREATE TRIGGER strikeflow_reply_command_binding_immutable
     BEFORE UPDATE ON strikeflow_connector_reply_receipt
     FOR EACH ROW EXECUTE FUNCTION reject_strikeflow_reply_command_binding_change();
@@ -19,7 +21,7 @@ CREATE TRIGGER strikeflow_reply_command_binding_immutable
 -- StrikeFlow connector. Relationships are enforced by the publisher's exact
 -- binding query rather than foreign keys so deletion and rollback stay
 -- explicit at the application layer.
-CREATE TABLE strikeflow_response_outbox (
+CREATE TABLE IF NOT EXISTS strikeflow_response_outbox (
     event_id UUID NOT NULL DEFAULT gen_random_uuid(),
     event_type TEXT NOT NULL CHECK (event_type IN ('agent_comment.created', 'task.completed')),
     strikeflow_command_id UUID NOT NULL,
@@ -83,6 +85,8 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS strikeflow_response_outbox_identity_immutable
+    ON strikeflow_response_outbox;
 CREATE TRIGGER strikeflow_response_outbox_identity_immutable
     BEFORE UPDATE ON strikeflow_response_outbox
     FOR EACH ROW EXECUTE FUNCTION reject_strikeflow_response_outbox_identity_change();

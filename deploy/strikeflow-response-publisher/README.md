@@ -12,6 +12,11 @@ not be added to the active project without a separate approved window.
 
 `verify-disabled-install.sh` requires the sealed release directory, the built
 candidate image tag, and the fresh preflight snapshot directory. It verifies
-checksums, disabled/blank configuration, absent credentials, no candidate
-container, unchanged active container identities/digests/ports, unchanged
-active Compose files, and an inactive/unenabled publisher service.
+checksums, strict artifact provenance, the candidate image digest and labels,
+disabled/blank configuration, absent credentials, no candidate container,
+unchanged active container identities/digests/ports and Compose inputs, and
+inactive/unenabled publisher units.
+
+The activation-only Compose overlay requires both the immutable candidate
+image digest and the dedicated host secret path. It intentionally has no
+fallback image or `/dev/null` secret mount.

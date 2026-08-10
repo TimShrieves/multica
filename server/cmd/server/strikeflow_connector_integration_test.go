@@ -2175,6 +2175,85 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 	`, commandID).Scan(&attentionCleared, &delivered); err != nil || !attentionCleared || !delivered {
 		t.Fatalf("attention recovery not cleared: cleared=%v delivered=%v err=%v", attentionCleared, delivered, err)
 	}
+	attentionCases := []struct {
+		name       string
+		statusCode int
+		body       func(eventID string) string
+	}{
+		{name: "permanent 400", statusCode: http.StatusBadRequest},
+		{name: "permanent 401", statusCode: http.StatusUnauthorized},
+		{name: "permanent 409", statusCode: http.StatusConflict},
+		{name: "permanent 413", statusCode: http.StatusRequestEntityTooLarge},
+		{
+			name:       "invalid acknowledgment",
+			statusCode: http.StatusOK,
+			body: func(eventID string) string {
+				return fmt.Sprintf(`{"ok":false,"data":{"event_id":%q}}`, eventID)
+			},
+		},
+		{
+			name:       "malformed acknowledgment",
+			statusCode: http.StatusOK,
+			body:       func(string) string { return `{"ok":` },
+		},
+		{
+			name:       "wrong event id acknowledgment",
+			statusCode: http.StatusOK,
+			body: func(string) string {
+				return `{"ok":true,"data":{"event_id":"10000000-0000-4000-8000-000000000099"}}`
+			},
+		},
+	}
+	for _, testCase := range attentionCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := testPool.Exec(t.Context(), `
+				UPDATE strikeflow_response_outbox
+				SET delivered_at=NULL,attempt_count=0,next_attempt_at=now(),needs_attention_at=NULL,
+				    lease_until=NULL,last_error=NULL
+				WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+			`, commandID); err != nil {
+				t.Fatal(err)
+			}
+			attentionWebhook := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(testCase.statusCode)
+				if testCase.body != nil {
+					_, _ = io.WriteString(w, testCase.body(r.Header.Get("X-Multica-Event-Id")))
+				}
+			}))
+			defer attentionWebhook.Close()
+			attentionPublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+				Enabled: true, WebhookURL: attentionWebhook.URL + "/api/integrations/multica/content-delivery/responses",
+				HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+				WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+				CommandIDs:  []string{commandID},
+				RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+				HTTPClient: attentionWebhook.Client(), NotBefore: time.Now().Add(-time.Hour),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if processed, err := attentionPublisher.DeliverOnce(t.Context()); err != nil || !processed {
+				t.Fatalf("attention delivery: processed=%v err=%v", processed, err)
+			}
+			var hasAttention, wasDelivered bool
+			if err := testPool.QueryRow(t.Context(), `
+				SELECT attempt_count,needs_attention_at IS NOT NULL,delivered_at IS NOT NULL
+				FROM strikeflow_response_outbox
+				WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+			`, commandID).Scan(&attempts, &hasAttention, &wasDelivered); err != nil || attempts != 1 || !hasAttention || wasDelivered {
+				t.Fatalf("immediate attention state: attempts=%d attention=%v delivered=%v err=%v", attempts, hasAttention, wasDelivered, err)
+			}
+			if _, err := testPool.Exec(t.Context(), `
+				UPDATE strikeflow_response_outbox SET next_attempt_at=now()
+				WHERE strikeflow_command_id=$1 AND event_type='task.completed'
+			`, commandID); err != nil {
+				t.Fatal(err)
+			}
+			if processed, err := attentionPublisher.DeliverOnce(t.Context()); err != nil || processed {
+				t.Fatalf("attention row was automatically reselected: processed=%v err=%v", processed, err)
+			}
+		})
+	}
 	if _, err := testPool.Exec(t.Context(), `
 		UPDATE strikeflow_connector_reply_receipt
 		SET strikeflow_command_id='10000000-0000-4000-8000-000000000006'
