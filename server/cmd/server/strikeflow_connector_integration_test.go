@@ -1841,8 +1841,9 @@ func TestStrikeFlowConnectorLegacyReplyHashReplayAndPublisherExclusion(t *testin
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{"10000000-0000-4000-8000-000000000099"},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{"10000000-0000-4000-8000-000000000099"},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -1919,8 +1920,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: f.issueID,
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: f.issueID,
 		NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -1939,8 +1941,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		NotBefore: time.Now().Add(time.Hour),
 	})
 	if err != nil {
@@ -1961,8 +1964,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -1979,12 +1983,56 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 	if _, err := testPool.Exec(t.Context(), `UPDATE agent_task_queue SET trigger_evidence_kind='comment' WHERE id=$1`, taskID); err != nil {
 		t.Fatal(err)
 	}
+	wrongCommandPublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{"10000000-0000-4000-8000-000000000006"},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrongCommandPublisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox WHERE strikeflow_command_id=$1
+	`, commandID).Scan(&excludedCount); err != nil || excludedCount != 0 {
+		t.Fatalf("unlisted explicit command entered outbox: count=%d err=%v", excludedCount, err)
+	}
+
+	lineagePublisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
+		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
+		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
+		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
+		AuthorizationMode: strikeflowresponse.AuthorizationModeReceiptLineage,
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		NotBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lineagePublisher.RecoverOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var lineageCount int
+	if err := testPool.QueryRow(t.Context(), `
+		SELECT count(*) FROM strikeflow_response_outbox
+		WHERE strikeflow_command_id=$1 AND member_comment_id=$2 AND continuation_task_id=$3
+		  AND (event_type='task.completed' OR agent_comment_id=ANY($4::uuid[]))
+	`, commandID, commentID, taskID, []string{agentCommentID, chainedAgentCommentID}).Scan(&lineageCount); err != nil || lineageCount != 3 {
+		t.Fatalf("receipt_lineage response outbox rows = %d err=%v", lineageCount, err)
+	}
 	publisher, err := strikeflowresponse.New(testPool, strikeflowresponse.Config{
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -2014,8 +2062,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: parentFailure.URL + "/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		HTTPClient: parentFailure.Client(), NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -2074,8 +2123,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: webhook.URL + "/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		HTTPClient: webhook.Client(), Now: func() time.Time { return time.Unix(1786172400, 0) },
 		NotBefore: time.Now().Add(-time.Hour),
 	})
@@ -2126,8 +2176,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 		Enabled: true, WebhookURL: failingWebhook.URL + "/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 		WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-		CommandIDs:  []string{commandID},
-		RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+		AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{commandID},
+		RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 		HTTPClient: failingWebhook.Client(), NotBefore: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
@@ -2225,8 +2276,9 @@ func TestStrikeFlowResponseRecoveryRequiresExactConnectorLineage(t *testing.T) {
 				Enabled: true, WebhookURL: attentionWebhook.URL + "/api/integrations/multica/content-delivery/responses",
 				HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "test-v1",
 				WorkspaceID: testWorkspaceID, WorkspaceKey: "strike", ProjectIDs: []string{f.projectID},
-				CommandIDs:  []string{commandID},
-				RecipientID: testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
+				AuthorizationMode: strikeflowresponse.AuthorizationModeExplicitCommands,
+				CommandIDs:        []string{commandID},
+				RecipientID:       testUserID, AgentID: agentID, STR94IssueID: "11111111-1111-4111-8111-111111111194",
 				HTTPClient: attentionWebhook.Client(), NotBefore: time.Now().Add(-time.Hour),
 			})
 			if err != nil {

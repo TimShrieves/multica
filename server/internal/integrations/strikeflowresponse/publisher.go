@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -37,8 +39,20 @@ const (
 )
 
 var keyIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+var requiredSecretOwnerUID uint32 = 0
 
 const responseWebhookPath = "/api/integrations/multica/content-delivery/responses"
+
+const (
+	protectedSTR94IssueID  = "b41bcb97-8b63-43f6-9d6c-4ee9e9ada891"
+	protectedSTR166IssueID = "39dcf540-bedf-4449-bc71-2e9e15fa0573"
+	protectedSTR172IssueID = "b1839f3d-97e5-449a-9059-21b3b393d096"
+)
+
+const (
+	AuthorizationModeExplicitCommands = "explicit_commands"
+	AuthorizationModeReceiptLineage   = "receipt_lineage"
+)
 
 // Config is intentionally exact and fail-closed. A publisher cannot be
 // enabled with a wildcard workspace, project, recipient, agent, or legacy
@@ -51,13 +65,18 @@ type Config struct {
 	WorkspaceID  string
 	WorkspaceKey string
 	ProjectIDs   []string
-	CommandIDs   []string
-	RecipientID  string
-	AgentID      string
-	STR94IssueID string
-	NotBefore    time.Time
-	HTTPClient   *http.Client
-	Now          func() time.Time
+	// AuthorizationMode chooses whether recovery is constrained to an
+	// operator-maintained command allowlist or to every post-floor receipt
+	// that satisfies the same exact connector lineage and scope joins.
+	AuthorizationMode string
+	CommandIDs        []string
+	RecipientID       string
+	AgentID           string
+	STR94IssueID      string
+	ExcludedIssueIDs  []string
+	NotBefore         time.Time
+	HTTPClient        *http.Client
+	Now               func() time.Time
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -74,9 +93,30 @@ func ConfigFromEnv() (Config, error) {
 	if !filepath.IsAbs(secretFile) {
 		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must be an absolute path")
 	}
-	secret, err := os.ReadFile(secretFile)
+	secretFD, err := unix.Open(secretFile, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return config, fmt.Errorf("open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE without following symlinks: %w", err)
+	}
+	secretHandle := os.NewFile(uintptr(secretFD), secretFile)
+	if secretHandle == nil {
+		_ = unix.Close(secretFD)
+		return config, errors.New("open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE returned an invalid descriptor")
+	}
+	defer secretHandle.Close()
+	secretInfo, err := secretHandle.Stat()
+	if err != nil {
+		return config, fmt.Errorf("stat open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE: %w", err)
+	}
+	secretStat, ok := secretInfo.Sys().(*syscall.Stat_t)
+	if !ok || !secretInfo.Mode().IsRegular() || secretInfo.Mode().Perm() != 0o600 || secretStat.Uid != requiredSecretOwnerUID {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must be a regular root-owned mode-0600 file")
+	}
+	secret, err := io.ReadAll(io.LimitReader(secretHandle, 4097))
 	if err != nil {
 		return config, fmt.Errorf("read STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE: %w", err)
+	}
+	if len(secret) > 4096 {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must not exceed 4096 bytes")
 	}
 	config.HMACSecret = string(secret)
 	if config.HMACSecret != strings.TrimSpace(config.HMACSecret) {
@@ -86,17 +126,43 @@ func ConfigFromEnv() (Config, error) {
 	config.WorkspaceID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_WORKSPACE_ID"))
 	config.WorkspaceKey = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_WORKSPACE_KEY"))
 	config.ProjectIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_PROJECT_IDS"))
+	config.AuthorizationMode = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE"))
 	config.CommandIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_COMMAND_IDS"))
 	config.RecipientID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_RECIPIENT_ID"))
 	config.AgentID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_AGENT_ID"))
 	config.STR94IssueID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_STR94_ISSUE_ID"))
+	config.ExcludedIssueIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS"))
+	if config.STR94IssueID != protectedSTR94IssueID || !sameStringSet(config.ExcludedIssueIDs, []string{
+		protectedSTR94IssueID, protectedSTR166IssueID, protectedSTR172IssueID,
+	}) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS must exactly protect STR-94, STR-166, and STR-172")
+	}
 	notBefore := strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_NOT_BEFORE"))
 	parsedNotBefore, err := time.Parse(time.RFC3339, notBefore)
 	if err != nil {
 		return config, errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE must be an exact RFC3339 timestamp")
 	}
 	config.NotBefore = parsedNotBefore
+	if config.NotBefore.After(time.Now().UTC()) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE must not be in the future")
+	}
 	return config, config.Validate()
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	want := make(map[string]struct{}, len(right))
+	for _, value := range right {
+		want[value] = struct{}{}
+	}
+	for _, value := range left {
+		if _, ok := want[value]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func splitExactList(value string) []string {
@@ -139,12 +205,34 @@ func (c Config) Validate() error {
 		return errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE is required when the publisher is enabled")
 	}
 	ids := append([]string{c.WorkspaceID, c.RecipientID, c.AgentID, c.STR94IssueID}, c.ProjectIDs...)
-	ids = append(ids, c.CommandIDs...)
+	ids = append(ids, c.ExcludedIssueIDs...)
+	if len(c.ExcludedIssueIDs) > 0 {
+		protected := false
+		for _, issueID := range c.ExcludedIssueIDs {
+			if issueID == c.STR94IssueID {
+				protected = true
+				break
+			}
+		}
+		if !protected {
+			return errors.New("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS must include STRIKEFLOW_RESPONSE_STR94_ISSUE_ID")
+		}
+	}
 	if len(c.ProjectIDs) == 0 || len(c.ProjectIDs) > 32 {
 		return errors.New("STRIKEFLOW_RESPONSE_PROJECT_IDS must contain 1-32 exact project UUIDs")
 	}
-	if len(c.CommandIDs) == 0 || len(c.CommandIDs) > 32 {
-		return errors.New("STRIKEFLOW_RESPONSE_COMMAND_IDS must contain 1-32 exact command UUIDs")
+	switch c.AuthorizationMode {
+	case AuthorizationModeExplicitCommands:
+		if len(c.CommandIDs) == 0 || len(c.CommandIDs) > 32 {
+			return errors.New("STRIKEFLOW_RESPONSE_COMMAND_IDS must contain 1-32 exact command UUIDs in explicit_commands mode")
+		}
+		ids = append(ids, c.CommandIDs...)
+	case AuthorizationModeReceiptLineage:
+		if len(c.CommandIDs) != 0 {
+			return errors.New("STRIKEFLOW_RESPONSE_COMMAND_IDS must be empty in receipt_lineage mode")
+		}
+	default:
+		return errors.New("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE must be explicit_commands or receipt_lineage")
 	}
 	for _, value := range ids {
 		if _, err := uuid.Parse(value); err != nil {
@@ -152,6 +240,13 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) excludedIssueIDs() []string {
+	if len(c.ExcludedIssueIDs) > 0 {
+		return c.ExcludedIssueIDs
+	}
+	return []string{c.STR94IssueID}
 }
 
 type Publisher struct {
@@ -253,14 +348,14 @@ func (p *Publisher) RecoverOnce(ctx context.Context) error {
 	}
 	if _, err := p.pool.Exec(ctx, recoverAgentCommentsSQL,
 		p.config.WorkspaceID, p.config.ProjectIDs, p.config.RecipientID,
-		p.config.AgentID, p.config.STR94IssueID, maxResponseBytes, p.config.WorkspaceKey,
-		p.config.NotBefore, p.config.CommandIDs); err != nil {
+		p.config.AgentID, p.config.excludedIssueIDs(), maxResponseBytes, p.config.WorkspaceKey,
+		p.config.NotBefore, p.config.AuthorizationMode, p.config.CommandIDs); err != nil {
 		return fmt.Errorf("recover agent comments: %w", err)
 	}
 	if _, err := p.pool.Exec(ctx, recoverTaskCompletionsSQL,
 		p.config.WorkspaceID, p.config.ProjectIDs, p.config.RecipientID,
-		p.config.AgentID, p.config.STR94IssueID, p.config.WorkspaceKey,
-		p.config.NotBefore, p.config.CommandIDs); err != nil {
+		p.config.AgentID, p.config.excludedIssueIDs(), p.config.WorkspaceKey,
+		p.config.NotBefore, p.config.AuthorizationMode, p.config.CommandIDs); err != nil {
 		return fmt.Errorf("recover task completions: %w", err)
 	}
 	return nil
@@ -299,10 +394,10 @@ WHERE c.author_type='agent'
   AND q.originator_source='direct_human'
   AND q.trigger_evidence_kind='comment'
   AND q.trigger_evidence_ref_id=rr.comment_id
-  AND i.id<>$5::uuid
+  AND i.id<>ALL($5::uuid[])
   AND octet_length(c.content)<=$6
   AND rr.strikeflow_command_id IS NOT NULL
-  AND rr.strikeflow_command_id=ANY($9::uuid[])
+  AND ($9::text='receipt_lineage' OR rr.strikeflow_command_id=ANY($10::uuid[]))
   AND rr.created_at >= $8::timestamptz
   AND rr.committed_at >= $8::timestamptz
   AND c.created_at >= $8::timestamptz
@@ -357,9 +452,9 @@ WHERE q.status='completed' AND q.completed_at IS NOT NULL
   AND q.originator_source='direct_human'
   AND q.trigger_evidence_kind='comment'
   AND q.trigger_evidence_ref_id=rr.comment_id
-  AND i.id<>$5::uuid
+  AND i.id<>ALL($5::uuid[])
   AND rr.strikeflow_command_id IS NOT NULL
-  AND rr.strikeflow_command_id=ANY($8::uuid[])
+  AND ($8::text='receipt_lineage' OR rr.strikeflow_command_id=ANY($9::uuid[]))
   AND rr.created_at >= $7::timestamptz
   AND rr.committed_at >= $7::timestamptz
   AND q.completed_at >= $7::timestamptz

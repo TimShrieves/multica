@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +23,9 @@ const (
 	testProject   = "d98f5700-8946-4054-b763-001d85767036"
 	testRecipient = "92008a79-f6ce-438d-b60f-4dd6580f94e4"
 	testAgent     = "eb361a09-be12-4626-9d03-faadc99a3933"
-	testSTR94     = "11111111-1111-4111-8111-111111111194"
+	testSTR94     = protectedSTR94IssueID
+	testSTR166    = protectedSTR166IssueID
+	testSTR172    = protectedSTR172IssueID
 	testCommand   = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 )
 
@@ -31,9 +34,11 @@ func validConfig() Config {
 		Enabled: true, WebhookURL: "https://strikeflow.example.test/api/integrations/multica/content-delivery/responses",
 		HMACSecret: "0123456789abcdef0123456789abcdef", HMACKeyID: "multica-v1",
 		WorkspaceID: testWorkspace, WorkspaceKey: "strike", ProjectIDs: []string{testProject},
-		CommandIDs:  []string{testCommand},
-		RecipientID: testRecipient, AgentID: testAgent, STR94IssueID: testSTR94,
-		NotBefore: time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC),
+		AuthorizationMode: AuthorizationModeExplicitCommands,
+		CommandIDs:        []string{testCommand},
+		RecipientID:       testRecipient, AgentID: testAgent, STR94IssueID: testSTR94,
+		ExcludedIssueIDs: []string{testSTR94, testSTR166, testSTR172},
+		NotBefore:        time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -60,6 +65,7 @@ func TestConfigEnabledRequiresEveryExactScope(t *testing.T) {
 		{"workspace", func(c *Config) { c.WorkspaceID = "" }},
 		{"workspace key", func(c *Config) { c.WorkspaceKey = "" }},
 		{"projects", func(c *Config) { c.ProjectIDs = nil }},
+		{"authorization mode", func(c *Config) { c.AuthorizationMode = "" }},
 		{"commands", func(c *Config) { c.CommandIDs = nil }},
 		{"recipient", func(c *Config) { c.RecipientID = "" }},
 		{"agent", func(c *Config) { c.AgentID = "" }},
@@ -83,7 +89,47 @@ func TestConfigEnabledAcceptsExactValidScope(t *testing.T) {
 	}
 }
 
+func TestConfigAuthorizationModesAreExplicitAndNonAmbiguous(t *testing.T) {
+	explicit := validConfig()
+	if err := explicit.Validate(); err != nil {
+		t.Fatalf("explicit_commands mode rejected: %v", err)
+	}
+
+	lineage := validConfig()
+	lineage.AuthorizationMode = AuthorizationModeReceiptLineage
+	lineage.CommandIDs = nil
+	if err := lineage.Validate(); err != nil {
+		t.Fatalf("receipt_lineage mode rejected: %v", err)
+	}
+
+	lineage.CommandIDs = []string{testCommand}
+	if err := lineage.Validate(); err == nil {
+		t.Fatal("receipt_lineage accepted an ambiguous command allowlist")
+	}
+
+	unknown := validConfig()
+	unknown.AuthorizationMode = "all_receipts"
+	if err := unknown.Validate(); err == nil {
+		t.Fatal("unknown authorization mode was accepted")
+	}
+}
+
+func TestHistoricalExclusionsAlwaysContainSTR94AndBindAsAnArray(t *testing.T) {
+	config := validConfig()
+	config.ExcludedIssueIDs = []string{testSTR166, testSTR172}
+	if err := config.Validate(); err == nil {
+		t.Fatal("historical exclusions omitted STR-94")
+	}
+	if !strings.Contains(recoverAgentCommentsSQL, "i.id<>ALL($5::uuid[])") ||
+		!strings.Contains(recoverTaskCompletionsSQL, "i.id<>ALL($5::uuid[])") {
+		t.Fatal("recovery queries do not exclude the entire protected issue ledger")
+	}
+}
+
 func TestConfigFromEnvRequiresExactRFC3339Cutoff(t *testing.T) {
+	previousOwner := requiredSecretOwnerUID
+	requiredSecretOwnerUID = uint32(os.Getuid())
+	t.Cleanup(func() { requiredSecretOwnerUID = previousOwner })
 	secretFile := filepath.Join(t.TempDir(), "response-hmac")
 	if err := os.WriteFile(secretFile, []byte(validConfig().HMACSecret), 0o600); err != nil {
 		t.Fatal(err)
@@ -95,10 +141,12 @@ func TestConfigFromEnvRequiresExactRFC3339Cutoff(t *testing.T) {
 	t.Setenv("STRIKEFLOW_RESPONSE_WORKSPACE_ID", testWorkspace)
 	t.Setenv("STRIKEFLOW_RESPONSE_WORKSPACE_KEY", "strike")
 	t.Setenv("STRIKEFLOW_RESPONSE_PROJECT_IDS", testProject)
+	t.Setenv("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE", AuthorizationModeExplicitCommands)
 	t.Setenv("STRIKEFLOW_RESPONSE_COMMAND_IDS", testCommand)
 	t.Setenv("STRIKEFLOW_RESPONSE_RECIPIENT_ID", testRecipient)
 	t.Setenv("STRIKEFLOW_RESPONSE_AGENT_ID", testAgent)
 	t.Setenv("STRIKEFLOW_RESPONSE_STR94_ISSUE_ID", testSTR94)
+	t.Setenv("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS", testSTR94+","+testSTR166+","+testSTR172)
 	t.Setenv("STRIKEFLOW_RESPONSE_NOT_BEFORE", "2026-08-08 00:00:00")
 	if _, err := ConfigFromEnv(); err == nil {
 		t.Fatal("non-RFC3339 activation cutoff was accepted")
@@ -108,9 +156,27 @@ func TestConfigFromEnvRequiresExactRFC3339Cutoff(t *testing.T) {
 	if err != nil || !config.NotBefore.Equal(time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("RFC3339 activation cutoff rejected: config=%v err=%v", config.NotBefore, err)
 	}
+	t.Setenv("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE", AuthorizationModeReceiptLineage)
+	t.Setenv("STRIKEFLOW_RESPONSE_COMMAND_IDS", "")
+	config, err = ConfigFromEnv()
+	if err != nil || config.AuthorizationMode != AuthorizationModeReceiptLineage || len(config.CommandIDs) != 0 {
+		t.Fatalf("receipt_lineage environment rejected: mode=%q commands=%v err=%v", config.AuthorizationMode, config.CommandIDs, err)
+	}
+	t.Setenv("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS", "")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("enabled environment accepted a missing historical exclusion ledger")
+	}
+	t.Setenv("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS", testSTR94+","+testSTR166+","+testSTR172)
+	t.Setenv("STRIKEFLOW_RESPONSE_NOT_BEFORE", time.Now().UTC().Add(time.Hour).Format(time.RFC3339))
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("future activation cutoff was accepted")
+	}
 }
 
 func TestConfigFromEnvRejectsRawSecretAndWhitespaceFile(t *testing.T) {
+	previousOwner := requiredSecretOwnerUID
+	requiredSecretOwnerUID = uint32(os.Getuid())
+	t.Cleanup(func() { requiredSecretOwnerUID = previousOwner })
 	t.Setenv("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", "true")
 	t.Setenv("STRIKEFLOW_RESPONSE_HMAC_SECRET", validConfig().HMACSecret)
 	if _, err := ConfigFromEnv(); err == nil {
@@ -124,6 +190,33 @@ func TestConfigFromEnvRejectsRawSecretAndWhitespaceFile(t *testing.T) {
 	t.Setenv("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE", secretFile)
 	if _, err := ConfigFromEnv(); err == nil {
 		t.Fatal("signing secret file with surrounding whitespace was accepted")
+	}
+}
+
+func TestConfigFromEnvRejectsUnsafeSecretFileMetadata(t *testing.T) {
+	previousOwner := requiredSecretOwnerUID
+	requiredSecretOwnerUID = uint32(os.Getuid())
+	t.Cleanup(func() { requiredSecretOwnerUID = previousOwner })
+	directory := t.TempDir()
+	secretFile := filepath.Join(directory, "response-hmac")
+	if err := os.WriteFile(secretFile, []byte(validConfig().HMACSecret), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", "true")
+	t.Setenv("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE", secretFile)
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("world-readable signing secret was accepted")
+	}
+	if err := os.Chmod(secretFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretLink := filepath.Join(directory, "response-hmac-link")
+	if err := os.Symlink(secretFile, secretLink); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE", secretLink)
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("symlink signing secret was accepted")
 	}
 }
 
