@@ -19,7 +19,7 @@ test -f "$release_dir/SHA256SUMS"
 
 test "$(stat -c '%U:%G %a' "$config_file")" = "root:root 600"
 test "$(grep -c '^STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=false$' "$config_file")" -eq 1
-if grep -Eq '^STRIKEFLOW_RESPONSE_(PUBLISHER_ENABLED=true|WEBHOOK_URL=.+|HMAC_SECRET|HMAC_SECRET_FILE=.+|HMAC_KEY_ID=.+|WORKSPACE_ID=.+|WORKSPACE_KEY=.+|PROJECT_IDS=.+|COMMAND_IDS=.+|RECIPIENT_ID=.+|AGENT_ID=.+|STR94_ISSUE_ID=.+|NOT_BEFORE=.+)' "$config_file"; then
+if grep -Eq '^STRIKEFLOW_RESPONSE_(PUBLISHER_ENABLED=true|WEBHOOK_URL=.+|HMAC_SECRET=.+|HMAC_SECRET_FILE=.+|HMAC_KEY_ID=.+|WORKSPACE_ID=.+|WORKSPACE_KEY=.+|PROJECT_IDS=.+|COMMAND_IDS=.+|RECIPIENT_ID=.+|AGENT_ID=.+|STR94_ISSUE_ID=.+|NOT_BEFORE=.+)' "$config_file"; then
   echo "publisher configuration is not dormant" >&2
   exit 1
 fi
