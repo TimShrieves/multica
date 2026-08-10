@@ -11,22 +11,29 @@ image_tag=$2
 preflight_dir=$3
 install_root=/opt/multica-response-publisher
 config_file=/etc/multica-response-publisher/publisher.env
-artifacts_file=$release_dir/ARTIFACTS
 
-case "$(readlink -f "$release_dir")" in
+resolved_release_dir=$(readlink -f "$release_dir")
+resolved_preflight_dir=$(readlink -f "$preflight_dir")
+case "$resolved_release_dir" in
   /opt/multica-response-publisher/releases/*) ;;
   *) echo "release path escaped install root" >&2; exit 1 ;;
 esac
-case "$(readlink -f "$preflight_dir")" in
+case "$resolved_preflight_dir" in
   /var/backups/multica-response-publisher/*) ;;
   *) echo "preflight path escaped backup root" >&2; exit 1 ;;
 esac
+test "$(readlink -f "$install_root/current")" = "$resolved_release_dir"
+release_dir=$resolved_release_dir
+preflight_dir=$resolved_preflight_dir
+artifacts_file=$release_dir/ARTIFACTS
 
-test "$(readlink -f "$install_root/current")" = "$(readlink -f "$release_dir")"
 test -d "$release_dir"
 test -f "$release_dir/SHA256SUMS"
 test -f "$artifacts_file"
 test "$(stat -c '%U:%G' "$release_dir")" = root:root
+test -z "$(find "$release_dir" -xdev -type l -print -quit)"
+test -z "$(find "$preflight_dir" -xdev -type l -print -quit)"
+test -z "$(find "$release_dir" -xdev -name '._*' -print -quit)"
 test -z "$(find "$release_dir" -xdev -perm /022 -print -quit)"
 test "$(stat -c '%U:%G %a' "$preflight_dir")" = "root:root 700"
 (cd "$release_dir" && sha256sum -c SHA256SUMS)
