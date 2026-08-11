@@ -483,6 +483,27 @@ esac
 	run("dispatch-service-pid", "", "", "strikeflow-multica-content-dispatch.service", false)
 }
 
+func TestPredecessorReconcileAllowsStaticDormantUnits(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "reconcile-predecessor-ledger.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(script)
+	for _, fragment := range []string{
+		`enabled_state=$(systemctl is-enabled`,
+		`case "$enabled_state" in`,
+		`enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)`,
+	} {
+		if !strings.Contains(s, fragment) {
+			t.Fatalf("predecessor reconciler must classify enablement state explicitly; missing %q", fragment)
+		}
+	}
+	if strings.Contains(s, `systemctl is-enabled --quiet "$unit"`) {
+		t.Fatal("predecessor reconciler must not reject static units via is-enabled --quiet")
+	}
+}
+
 func TestReplayUtilityUsesSealedBinaryAndNeverMutatesOutbox(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "replay-delivered-comment.sh"))
