@@ -1662,6 +1662,10 @@ func TestStrikeFlowConnectorNaturalReviewRechecksLockedEvidenceBeforeReply(t *te
 	if _, err := blocker.Exec(t.Context(), `SELECT id FROM issue WHERE id=$1 FOR UPDATE`, f.issueID); err != nil {
 		t.Fatal(err)
 	}
+	var blockerPID int
+	if err := blocker.QueryRow(t.Context(), `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
 	key := "00000000-0000-4000-8000-000000000066"
 	type replyResult struct {
 		resp *http.Response
@@ -1696,10 +1700,9 @@ func TestStrikeFlowConnectorNaturalReviewRechecksLockedEvidenceBeforeReply(t *te
 			SELECT EXISTS (
 				SELECT 1 FROM pg_stat_activity
 				WHERE datname=current_database()
-				  AND query LIKE '%strikeflow_locked_inbox_recheck%'
-				  AND cardinality(pg_blocking_pids(pid)) > 0
+				  AND $1 = ANY(pg_blocking_pids(pid))
 			)
-		`).Scan(&blocked); err != nil {
+		`, blockerPID).Scan(&blocked); err != nil {
 			t.Fatal(err)
 		}
 		if blocked {
@@ -1795,8 +1798,9 @@ func TestStrikeFlowConnectorLegacyReplyHashReplayAndPublisherExclusion(t *testin
 	var commandIsNull bool
 	if err := testPool.QueryRow(t.Context(), `
 		SELECT token_id::text,payload_hash,strikeflow_command_id IS NULL
-		FROM strikeflow_connector_reply_receipt WHERE idempotency_key=$1
-	`, key).Scan(&tokenID, &storedHash, &commandIsNull); err != nil {
+		FROM strikeflow_connector_reply_receipt
+		WHERE inbox_item_id=$1 AND idempotency_key=$2
+	`, f.itemID, key).Scan(&tokenID, &storedHash, &commandIsNull); err != nil {
 		t.Fatal(err)
 	}
 	legacyHashInput := strings.Join([]string{tokenID, f.itemID, f.issueID, f.rootID, message}, "\x00")
