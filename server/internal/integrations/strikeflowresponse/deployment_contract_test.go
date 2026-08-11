@@ -516,6 +516,21 @@ func TestPredecessorReconcileAcceptsOriginalBaseEnv(t *testing.T) {
 	}
 }
 
+func TestPredecessorReconcileHMACCheckDoesNotRaiseNone(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "reconcile-predecessor-ledger.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(script)
+	if strings.Contains(s, `raise SystemExit("HMAC mount present") if any(`) {
+		t.Fatal("HMAC absence must be a normal successful path, not raise None")
+	}
+	if !strings.Contains(s, `if any(m.get("Destination") == "/run/secrets/strikeflow_response_hmac"`) {
+		t.Fatal("HMAC mount check must explicitly raise only when a mount is present")
+	}
+}
+
 func TestReplayUtilityUsesSealedBinaryAndNeverMutatesOutbox(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "replay-delivered-comment.sh"))
