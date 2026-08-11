@@ -73,7 +73,7 @@ for timer in strikeflow-multica-content-dispatch.timer strikeflow-multica-conten
 done
 
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  --before-start --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
+  --migration-preflight --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
 
 install -d -o root -g root -m 0700 "$evidence_dir"
 install -o root -g root -m 0600 "$backup_sha" "$evidence_dir/backup.sha256"

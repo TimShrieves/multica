@@ -151,6 +151,13 @@ this mainline-aware wrapper. It holds the shared response-producer advisory
 lock while the migrator runs, requires all publisher/dispatch/ongoing units to
 remain quiescent, passes the allowlist explicitly into the one-off container,
 and accepts the already-delivered outbox rows without permitting unsafe rows.
+Because the predecessor database intentionally lacks the approved migration
+set at this point, the wrapper first uses
+`verify-candidate-disabled-install.sh --migration-preflight
+--allow-delivered-outbox` for identity/quiescence checks only. It then runs the
+bounded migrator and invokes the full catalog verifier afterward; do not replace
+the migration-preflight mode with a normal readiness check before the migration
+has run.
 
 After the catalog gate succeeds, deploy the candidate backend with the
 publisher exactly false and every response scope/key/floor blank. The disabled
@@ -204,7 +211,8 @@ Using only the publisher env can silently replace database/JWT inputs with
 defaults; putting the pin file last can silently restore the old image. Always
 inspect the rendered config without printing values.
 
-After the seven migrations and receiver gate are separately approved, stage the
+After the approved mainline migration set and receiver gate are separately
+approved, stage the
 exact enabled config and secret, then run:
 
 ```text

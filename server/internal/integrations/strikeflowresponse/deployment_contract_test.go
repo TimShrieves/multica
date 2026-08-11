@@ -148,7 +148,7 @@ func TestMainlineMigrationGateIsBoundedAndProducerFrozen(t *testing.T) {
 	}
 	verifierText := string(verifier)
 	for _, required := range []string{
-		"while [ \"$#\" -gt 0 ]", "--before-start", "--allow-delivered-outbox",
+		"while [ \"$#\" -gt 0 ]", "--before-start", "--migration-preflight", "--allow-delivered-outbox",
 		"outbox_policy=delivered",
 	} {
 		if !strings.Contains(verifierText, required) {
@@ -171,6 +171,7 @@ func TestMainlineMigrationGateIsBoundedAndProducerFrozen(t *testing.T) {
 		"migration-ledger.after.normalized",
 		"MULTICA_MIGRATION_ALLOWLIST",
 		"pg_advisory_lock(hashtextextended('multica.strikeflow.response.producer.freeze'",
+		"--migration-preflight --allow-delivered-outbox",
 		"--before-start --allow-delivered-outbox",
 		"strikeflow-multica-content-ongoing.service",
 		"strikeflow-multica-content-dispatch.timer",
