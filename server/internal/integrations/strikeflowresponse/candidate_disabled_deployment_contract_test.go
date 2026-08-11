@@ -122,7 +122,7 @@ func TestDisabledCandidateRollbackVerifiesBeforeRestoreAndPreservesEvidence(t *t
 
 func TestProductionMigrationWrapperUsesOneOffMigratorAndNeverStartsBackend(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
-	raw, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "apply-production-migrations.sh"))
+	raw, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "apply-mainline-migrations.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,13 +132,14 @@ func TestProductionMigrationWrapperUsesOneOffMigratorAndNeverStartsBackend(t *te
 		`test "$image_digest" = "$artifact_image_digest"`,
 		`docker image inspect "$image_digest"`,
 		`test "$expected_backup_name" = "$(basename "$backup_file")"`,
-		"run --name", "--rm --no-deps -T backend up", "verify-candidate-disabled-install.sh",
-		"command_column_exists|true", "non_null_command_bindings|0",
+		"run --name", "--rm --no-deps -T -e", "MULTICA_MIGRATION_ALLOWLIST", "backend up", "verify-candidate-disabled-install.sh",
+		"outbox_identity|", "content_identity|", "outbox_state|",
 		"253_strikeflow_response_outbox", "257_strikeflow_response_outbox_event_id_unique",
 		"258_strikeflow_content_reply_connector", "259_strikeflow_content_reply_receipt_unique",
-		"migration-ledger.expected-before", "migration-ledger.expected-after",
-		"migration-ledger.actual-before", "migration-ledger.actual-after", "cmp",
-		"outbox_rows|0", "needs_attention|0", "failure-residual-migrator.txt", "database.failure-final", "SHA256SUMS",
+		"migration-ledger.expected-before", "migration-ledger.before.normalized",
+		"migration-ledger.after.normalized", "cmp", "producer-freeze.fifo",
+		"strikeflow-multica-content-ongoing.service", "strikeflow-multica-content-dispatch.timer",
+		"failure-migrator-stop.log", "database.failure-final", "SHA256SUMS",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("production migration wrapper missing %q", required)

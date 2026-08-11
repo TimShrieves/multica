@@ -139,6 +139,62 @@ func TestCandidateVerifierCanPreserveFailedOutboxWithoutWeakeningRuntimeChecks(t
 	}
 }
 
+func TestMainlineMigrationGateIsBoundedAndProducerFrozen(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	deploy := filepath.Join(root, "deploy", "strikeflow-response-publisher")
+	verifier, err := os.ReadFile(filepath.Join(deploy, "verify-candidate-disabled-install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifierText := string(verifier)
+	for _, required := range []string{
+		"while [ \"$#\" -gt 0 ]", "--before-start", "--allow-delivered-outbox",
+		"outbox_policy=delivered",
+	} {
+		if !strings.Contains(verifierText, required) {
+			t.Fatalf("candidate verifier must support combined pre-start/delivered mode %q", required)
+		}
+	}
+	gate, err := os.ReadFile(filepath.Join(deploy, "apply-mainline-migrations.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateText := string(gate)
+	for _, required := range []string{
+		"224_agent_task_session_rollout_missing",
+		"252_strikeflow_connector_principal",
+		"258_strikeflow_content_reply_connector",
+		"259_strikeflow_content_reply_receipt_unique",
+		"260_strikeflow_response_outbox_identity_immutable",
+		"900001_strikeflow_response_outbox",
+		"migration-ledger.before.normalized",
+		"migration-ledger.after.normalized",
+		"MULTICA_MIGRATION_ALLOWLIST",
+		"pg_advisory_lock(hashtextextended('multica.strikeflow.response.producer.freeze'",
+		"--before-start --allow-delivered-outbox",
+		"strikeflow-multica-content-ongoing.service",
+		"strikeflow-multica-content-dispatch.timer",
+		"outbox_identity|",
+		"cmp \"$evidence_dir/database.before\" \"$evidence_dir/database.after\"",
+	} {
+		if !strings.Contains(gateText, required) {
+			t.Fatalf("mainline migration gate is missing bounded-scope contract %q", required)
+		}
+	}
+	for _, forbidden := range []string{"migrate down", "DROP DATABASE", "TRUNCATE strikeflow_", "DELETE FROM strikeflow_"} {
+		if strings.Contains(gateText, forbidden) {
+			t.Fatalf("mainline migration gate contains forbidden operation %q", forbidden)
+		}
+	}
+	legacy, err := os.ReadFile(filepath.Join(deploy, "apply-production-migrations.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(legacy), "apply-mainline-migrations.sh") {
+		t.Fatal("historical migration entrypoint must delegate to the bounded mainline gate")
+	}
+}
+
 func TestReconciledPendingAdoptionIsExactAuditedAndDeliveryOnly(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	deploy := filepath.Join(root, "deploy", "strikeflow-response-publisher")

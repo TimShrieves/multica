@@ -63,11 +63,11 @@ restore_disabled_candidate() {
     up -d --no-deps --force-recreate backend || return 1
   wait_for_ready || return 1
   "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-    "$release_dir" "$image_digest" "$preflight_dir"
+    --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
 }
 
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  --before-start "$release_dir" "$image_digest" "$preflight_dir"
+  --before-start --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
 restored_image_ref=$(docker compose --project-directory /opt/multica --env-file "$base_env" \
   -f "$base_compose" -f "$pin_compose" config --format json |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["backend"]["image"])')
@@ -134,7 +134,7 @@ docker compose --project-directory /opt/multica --env-file "$base_env" \
 
 wait_for_ready
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  "$release_dir" "$image_digest" "$preflight_dir" >"$evidence_dir/verifier.after.log"
+  --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir" >"$evidence_dir/verifier.after.log"
 database_fingerprint >"$evidence_dir/database.after"
 cmp -s "$evidence_dir/database.before" "$evidence_dir/database.after"
 docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}|{{json .Config.Entrypoint}}' \
