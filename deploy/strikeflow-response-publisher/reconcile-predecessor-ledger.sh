@@ -33,7 +33,9 @@ test "$(stat -c '%U:%G %a' "$backup_sha")" = "root:root 600"
 test "$(wc -l <"$backup_sha" | tr -d ' ')" -eq 1
 backup_expected_hash=$(awk 'NF == 2 {print $1}' "$backup_sha")
 backup_expected_name=$(awk 'NF == 2 {print $2}' "$backup_sha" | sed 's/^\*//')
-test "$backup_expected_name" = "$(basename "$backup_file")"
+# Accept the absolute filename emitted by `sha256sum /absolute/path` and the
+# basename emitted when the sidecar was created from its containing directory.
+test "$backup_expected_name" = "$backup_file" || test "$backup_expected_name" = "$(basename "$backup_file")"
 test "$backup_expected_hash" = "$(sha256sum "$backup_file" | awk '{print $1}')"
 test "$(readlink -f /opt/multica-response-publisher/current)" = "$release_dir"
 test -f "$release_dir/ARTIFACTS" -a -f "$release_dir/SHA256SUMS"
