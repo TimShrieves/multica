@@ -638,17 +638,53 @@ func TestEnabledVerifierChecksExactMainLineCatalogSemantics(t *testing.T) {
 		"indrelid='public.strikeflow_response_outbox'::regclass",
 		"tgrelid IN ('public.strikeflow_connector_reply_receipt'::regclass,'public.strikeflow_response_outbox'::regclass)",
 		"tgtype=19",
+		"strikeflow_response_outbox_identity_immutable",
+		"reject_strikeflow_response_outbox_identity_change",
+		"<> 2",
 		"p.prosrc",
 		"strikeflow command binding is immutable",
 		"253_strikeflow_response_outbox",
 		"257_strikeflow_response_outbox_event_id_unique",
 		"258_strikeflow_content_reply_connector",
 		"259_strikeflow_content_reply_receipt_unique",
+		"260_strikeflow_response_outbox_identity_immutable",
 		"strikeflow_connector_token_content_reply_scope_check",
 		"idx_strikeflow_content_reply_receipt_unique",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("enabled verifier is missing exact immutability gate %q", required)
+		}
+	}
+}
+
+func TestPredecessorLedgerReconciliationIsSeparateEvidencePreservingGate(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "reconcile-predecessor-ledger.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"--confirm-reconcile", "flock -n", "7244554146635925501",
+		"multica.strikeflow.response.producer.freeze", "pg_advisory_lock", "pg_advisory_unlock",
+		"900001_strikeflow_response_outbox", "253_strikeflow_response_outbox",
+		"900002_strikeflow_connector_reply_command_unique", "254_strikeflow_connector_reply_command_unique",
+		"900003_strikeflow_response_outbox_event_unique", "255_strikeflow_response_outbox_event_unique",
+		"900004_strikeflow_response_outbox_due_index", "256_strikeflow_response_outbox_due_index",
+		"900005_strikeflow_response_outbox_event_id_unique", "257_strikeflow_response_outbox_event_id_unique",
+		"235_strikeflow_connector_principal", "258_strikeflow_content_reply_connector",
+		"259_strikeflow_content_reply_receipt_unique", "idx_strikeflow_content_reply_receipt_unique",
+		"strikeflow_response_outbox", "strikeflow_connector_reply_receipt", "strikeflow_connector_content_reply_receipt",
+		"outbox_before", "reply_before", "content_before", "ledger_before",
+		"non-schema response evidence changed", "SHA256SUMS", "migration-ledger.after",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("predecessor reconciliation is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"UPDATE strikeflow_", "DELETE FROM", "TRUNCATE", "DROP TABLE", "migrate up", "migrate down"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("predecessor reconciliation contains forbidden mutation %q", forbidden)
 		}
 	}
 }

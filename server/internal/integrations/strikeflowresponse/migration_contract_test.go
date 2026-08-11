@@ -45,6 +45,7 @@ func TestResponseMigrationPortPreservesMainLineage(t *testing.T) {
 		"257_strikeflow_response_outbox_event_id_unique.up.sql",
 		"258_strikeflow_content_reply_connector.up.sql",
 		"259_strikeflow_content_reply_receipt_unique.up.sql",
+		"260_strikeflow_response_outbox_identity_immutable.up.sql",
 	} {
 		if _, err := os.Stat(filepath.Join(migrations, name)); err != nil {
 			t.Fatalf("required main-lineage migration %s is missing: %v", name, err)
@@ -55,19 +56,49 @@ func TestResponseMigrationPortPreservesMainLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{
-		"253_strikeflow_response_outbox.up.sql":                   true,
-		"253_strikeflow_response_outbox.down.sql":                 true,
-		"255_strikeflow_response_outbox_event_unique.up.sql":      true,
-		"255_strikeflow_response_outbox_event_unique.down.sql":    true,
-		"256_strikeflow_response_outbox_due_index.up.sql":         true,
-		"256_strikeflow_response_outbox_due_index.down.sql":       true,
-		"257_strikeflow_response_outbox_event_id_unique.up.sql":   true,
-		"257_strikeflow_response_outbox_event_id_unique.down.sql": true,
+		"253_strikeflow_response_outbox.up.sql":                      true,
+		"253_strikeflow_response_outbox.down.sql":                    true,
+		"255_strikeflow_response_outbox_event_unique.up.sql":         true,
+		"255_strikeflow_response_outbox_event_unique.down.sql":       true,
+		"256_strikeflow_response_outbox_due_index.up.sql":            true,
+		"256_strikeflow_response_outbox_due_index.down.sql":          true,
+		"257_strikeflow_response_outbox_event_id_unique.up.sql":      true,
+		"257_strikeflow_response_outbox_event_id_unique.down.sql":    true,
+		"260_strikeflow_response_outbox_identity_immutable.up.sql":   true,
+		"260_strikeflow_response_outbox_identity_immutable.down.sql": true,
 	}
 	for _, match := range matches {
 		if !allowed[filepath.Base(match)] {
 			t.Fatalf("unexpected response migration outside current main lineage: %s", match)
 		}
+	}
+}
+
+func TestOutboxIdentityMigrationIsForwardOnlyAndExact(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve migration contract test path")
+	}
+	migrations := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", "..", "migrations"))
+	up, err := os.ReadFile(filepath.Join(migrations, "260_strikeflow_response_outbox_identity_immutable.up.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"CREATE OR REPLACE FUNCTION reject_strikeflow_response_outbox_identity_change()",
+		"strikeflow response outbox identity is immutable",
+		"CREATE TRIGGER strikeflow_response_outbox_identity_immutable",
+	} {
+		if !strings.Contains(string(up), required) {
+			t.Fatalf("260 migration missing %q", required)
+		}
+	}
+	down, err := os.ReadFile(filepath.Join(migrations, "260_strikeflow_response_outbox_identity_immutable.down.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(down), "RAISE EXCEPTION") || strings.Contains(strings.ToUpper(string(down)), "DROP ") {
+		t.Fatal("260 down migration must abort without deleting evidence")
 	}
 }
 
