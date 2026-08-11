@@ -37,8 +37,11 @@ wait_for_ready() {
   return 1
 }
 
+# A dormant candidate may already contain delivered, immutable response rows
+# from a bounded canary. Preserve those rows while proving that no unsafe row
+# exists; rollback must never mistake delivered evidence for pending work.
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  "$release_dir" "$image_digest" "$preflight_dir"
+  --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
 expected_original_image=$(cut -d'|' -f2 "$preflight_dir/multica-backend-1.identity")
 expected_original_ports=$(cut -d'|' -f4 "$preflight_dir/multica-backend-1.identity")
 restored_image_ref=$(docker compose --project-directory /opt/multica --env-file "$base_env" \

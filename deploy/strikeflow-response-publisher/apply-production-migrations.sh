@@ -60,7 +60,8 @@ find "$release_dir/server/migrations" -maxdepth 1 -type f -name '*.up.sql' -prin
   sed 's/\.up\.sql$//' | LC_ALL=C sort >"$evidence_dir/migration-ledger.expected-after"
 grep -Fx '258_strikeflow_content_reply_connector' "$evidence_dir/migration-ledger.expected-after"
 grep -Fx '259_strikeflow_content_reply_receipt_unique' "$evidence_dir/migration-ledger.expected-after"
-grep -Ev '^(258_strikeflow_content_reply_connector|259_strikeflow_content_reply_receipt_unique)$' \
+grep -Fx '260_strikeflow_response_outbox_identity_immutable' "$evidence_dir/migration-ledger.expected-after"
+grep -Ev '^(258_strikeflow_content_reply_connector|259_strikeflow_content_reply_receipt_unique|260_strikeflow_response_outbox_identity_immutable)$' \
   "$evidence_dir/migration-ledger.expected-after" >"$evidence_dir/migration-ledger.expected-before"
 docker exec -i multica-postgres-1 sh -c \
   'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version FROM schema_migrations ORDER BY version"' \
@@ -77,7 +78,7 @@ SELECT 'response_migrations|' || string_agg(version,',' ORDER BY version) FROM s
   '253_strikeflow_response_outbox','254_strikeflow_connector_reply_command_unique',
   '255_strikeflow_response_outbox_event_unique','256_strikeflow_response_outbox_due_index',
   '257_strikeflow_response_outbox_event_id_unique','258_strikeflow_content_reply_connector',
-  '259_strikeflow_content_reply_receipt_unique');
+  '259_strikeflow_content_reply_receipt_unique','260_strikeflow_response_outbox_identity_immutable');
 SELECT 'outbox_exists|' || (to_regclass('public.strikeflow_response_outbox') IS NOT NULL);
 SELECT 'reply_receipts|' || count(*) || '|' || md5(string_agg((to_jsonb(r)-'strikeflow_command_id')::text,'|' ORDER BY r.token_id,r.idempotency_key)) FROM strikeflow_connector_reply_receipt r;
 SELECT 'command_column_exists|' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='strikeflow_connector_reply_receipt' AND column_name='strikeflow_command_id');
@@ -123,7 +124,7 @@ SELECT 'response_migrations|' || string_agg(version,',' ORDER BY version) FROM s
   '253_strikeflow_response_outbox','254_strikeflow_connector_reply_command_unique',
   '255_strikeflow_response_outbox_event_unique','256_strikeflow_response_outbox_due_index',
   '257_strikeflow_response_outbox_event_id_unique','258_strikeflow_content_reply_connector',
-  '259_strikeflow_content_reply_receipt_unique');
+  '259_strikeflow_content_reply_receipt_unique','260_strikeflow_response_outbox_identity_immutable');
 SELECT 'outbox_exists|' || (to_regclass('public.strikeflow_response_outbox') IS NOT NULL);
 SELECT 'reply_receipts|' || count(*) || '|' || md5(string_agg((to_jsonb(r)-'strikeflow_command_id')::text,'|' ORDER BY r.token_id,r.idempotency_key)) FROM strikeflow_connector_reply_receipt r;
 SQL
@@ -154,13 +155,13 @@ SELECT 'response_migrations|' || string_agg(version,',' ORDER BY version) FROM s
   '253_strikeflow_response_outbox','254_strikeflow_connector_reply_command_unique',
   '255_strikeflow_response_outbox_event_unique','256_strikeflow_response_outbox_due_index',
   '257_strikeflow_response_outbox_event_id_unique','258_strikeflow_content_reply_connector',
-  '259_strikeflow_content_reply_receipt_unique');
+  '259_strikeflow_content_reply_receipt_unique','260_strikeflow_response_outbox_identity_immutable');
 SELECT 'outbox_rows|' || count(*) FROM strikeflow_response_outbox;
 SELECT 'needs_attention|' || count(*) FROM strikeflow_response_outbox WHERE needs_attention_at IS NOT NULL;
 SELECT 'reply_receipts|' || count(*) || '|' || md5(string_agg((to_jsonb(r)-'strikeflow_command_id')::text,'|' ORDER BY r.token_id,r.idempotency_key)) FROM strikeflow_connector_reply_receipt r;
 SELECT 'non_null_command_bindings|' || count(*) FROM strikeflow_connector_reply_receipt WHERE strikeflow_command_id IS NOT NULL;
 SQL
-grep -Fx 'response_migrations|253_strikeflow_response_outbox,254_strikeflow_connector_reply_command_unique,255_strikeflow_response_outbox_event_unique,256_strikeflow_response_outbox_due_index,257_strikeflow_response_outbox_event_id_unique,258_strikeflow_content_reply_connector,259_strikeflow_content_reply_receipt_unique' "$evidence_dir/database.after"
+grep -Fx 'response_migrations|253_strikeflow_response_outbox,254_strikeflow_connector_reply_command_unique,255_strikeflow_response_outbox_event_unique,256_strikeflow_response_outbox_due_index,257_strikeflow_response_outbox_event_id_unique,258_strikeflow_content_reply_connector,259_strikeflow_content_reply_receipt_unique,260_strikeflow_response_outbox_identity_immutable' "$evidence_dir/database.after"
 grep -Fx 'outbox_rows|0' "$evidence_dir/database.after"
 grep -Fx 'needs_attention|0' "$evidence_dir/database.after"
 grep -Fx 'non_null_command_bindings|0' "$evidence_dir/database.after"

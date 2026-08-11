@@ -168,6 +168,13 @@ func main() {
 		slog.Error("failed to find migration files", "error", err)
 		os.Exit(1)
 	}
+	if allowlist := strings.TrimSpace(os.Getenv("MULTICA_MIGRATION_ALLOWLIST")); allowlist != "" {
+		files, err = filterMigrationFiles(files, allowlist)
+		if err != nil {
+			slog.Error("invalid migration allowlist", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	if err := runMigrations(ctx, pool, runOptions{
 		Direction: direction,
@@ -179,6 +186,41 @@ func main() {
 	}
 
 	fmt.Println("Done.")
+}
+
+// filterMigrationFiles is an explicit operator escape hatch for a bounded,
+// response-only production migration gate. The normal migrator remains
+// unchanged when MULTICA_MIGRATION_ALLOWLIST is unset. Every requested
+// version must exist in the direction's on-disk migration set, and the
+// returned files retain the repository's numeric order.
+func filterMigrationFiles(files []string, allowlist string) ([]string, error) {
+	wanted := map[string]bool{}
+	for _, raw := range strings.Split(allowlist, ",") {
+		version := strings.TrimSpace(raw)
+		if version == "" || wanted[version] {
+			return nil, fmt.Errorf("migration allowlist contains an empty or duplicate version")
+		}
+		wanted[version] = true
+	}
+	selected := make([]string, 0, len(wanted))
+	seen := map[string]bool{}
+	for _, file := range files {
+		version := migrations.ExtractVersion(file)
+		if wanted[version] {
+			selected = append(selected, file)
+			seen[version] = true
+		}
+	}
+	if len(selected) != len(wanted) {
+		missing := make([]string, 0)
+		for version := range wanted {
+			if !seen[version] {
+				missing = append(missing, version)
+			}
+		}
+		return nil, fmt.Errorf("migration allowlist version not found: %s", strings.Join(missing, ","))
+	}
+	return selected, nil
 }
 
 // runMigrations applies (direction="up") or rolls back (direction="down")

@@ -48,7 +48,7 @@ The sealed production order is exact:
 Before any backend restart, preserve a root-only preflight containing the
 effective Compose files, active container image identities and ports, the
 current migration ledger, and checksums of the backup copies themselves. Keep
-the publisher disabled while migrations `253`–`259` are rehearsed twice
+the publisher disabled while migrations `253`–`260` are rehearsed twice
 on a disposable clone of a fresh production dump. Migrations `254`–`257` and
 `259` are single-statement concurrent index builds; `257`
 binds the webhook event UUID as a database-unique delivery identity. A
@@ -66,7 +66,7 @@ integration tests against the clone. Production application is a separate
 approved one-shot candidate `migrate up`; never use backend startup as the SQL
 approval gate. Take a fresh encrypted database backup and root-only host
 preflight immediately before production application. Operational rollback never
-invokes migration down; forward-only migrations `257`–`259` explicitly abort.
+invokes migration down; forward-only migrations `257`–`260` explicitly abort.
 
 The sealed migration wrapper requires the fresh encrypted backup and checksum,
 uses a one-off `./migrate` container with no dependencies or published ports,
@@ -74,7 +74,7 @@ and proves that every active container identity remained unchanged:
 
 On the current main lineage, this production wrapper is deliberately narrower
 than the clone rehearsal: it requires the complete release migration ledger
-through `257`, proves that `258` and `259` are the only missing release migrations, and
+through `257`, proves that `258`, `259`, and `260` are the only missing release migrations, and
 compares the complete ledger again after the one-off migrator exits. Any other
 pending or unexpected migration fails before the migrator is created.
 This includes installations whose catalog is equivalent but whose migration
@@ -82,6 +82,62 @@ ledger uses the predecessor response lineage: the wrapper does not infer or
 write ledger aliases. Such a host requires a separately reviewed, approval-
 gated reconciliation that proves every catalog meaning before recording any
 current-main alias under the migration lock.
+
+### Predecessor-ledger reconciliation
+
+The installed VPS may contain the earlier local response ledger (`235` plus
+`900001`–`900005`) even though protected main names the same forward-only
+meanings `253`–`260`. Do not edit `schema_migrations` by hand and do not let
+normal startup infer aliases. The dedicated root-only gate below holds both
+the migration advisory lock and the shared response-producer lock, proves the
+old catalog, constraints, triggers, indexes, delivered-outbox state,
+receipt/content-receipt fingerprints, and quiescent producer units, then
+inserts only these five aliases while preserving each predecessor `applied_at`:
+
+```text
+900001_strikeflow_response_outbox                  -> 253_strikeflow_response_outbox
+900002_strikeflow_connector_reply_command_unique  -> 254_strikeflow_connector_reply_command_unique
+900003_strikeflow_response_outbox_event_unique    -> 255_strikeflow_response_outbox_event_unique
+900004_strikeflow_response_outbox_due_index       -> 256_strikeflow_response_outbox_due_index
+900005_strikeflow_response_outbox_event_id_unique -> 257_strikeflow_response_outbox_event_id_unique
+```
+
+The older `235` content-connector catalog remains recorded but is deliberately
+not aliased: its generic purpose constraint must be upgraded by the canonical
+`258` migration. Its additional immutable outbox-identity trigger is preserved
+and is explicitly accepted by the alias gate; migration `260` records that
+protection for clean installs. The gate never inserts `258`, `259`, or `260`,
+never drops or updates production rows, and fails closed if an unsafe/leased/
+attention outbox row, active producer, partial alias set, or catalog mismatch
+is found. It seals before/after runtime and database evidence, including a
+strict `SHA256SUMS` file:
+
+```text
+reconcile-predecessor-ledger.sh RELEASE CURRENT_PREFLIGHT ENCRYPTED_BACKUP BACKUP_SHA256 \
+  /var/backups/multica-response-publisher/reconcile-predecessor-ledger-<UTC>-<source> \
+  --confirm-reconcile
+```
+
+After this gate, `258`, `259`, and `260` remain pending. Apply them through a
+separately captured fresh encrypted backup and migration evidence gate; do not
+call the normal wrapper until its preflight explicitly proves the aliased
+`253`–`257` ledger and the three remaining `258`–`260` rows are the only
+pending release migrations. The alias gate is not an activation or
+publisher-enable action.
+
+### Mainline migration-gap gate
+
+`cmd/migrate` supports an explicit `MULTICA_MIGRATION_ALLOWLIST` only for a
+sealed one-off migration wrapper. The variable is unset in normal startup and
+must be passed into the migrator container explicitly; duplicate, unknown, or
+unlisted versions fail closed. A response-only allowlist (`258`, `259`, `260`)
+is not a readiness upgrade for a database whose mainline ledger is missing
+unrelated migrations. Before replacing the current backend with a binary from
+protected main, capture the complete missing set (including any `224`–`252`
+mainline rows absent from the predecessor VPS) and obtain explicit approval for
+that broader schema change, or ship a separately reviewed readiness-compatible
+candidate. Never silently filter unrelated migrations merely to make `/readyz`
+pass.
 
 ```text
 apply-production-migrations.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
@@ -275,7 +331,7 @@ activated candidate against `STARTING_PREFLIGHT`, then restore the exact
 original backend image and disabled response environment exclusively from
 `ORIGINAL_PREFLIGHT`, then
 recreate only the backend container and verify its image digest, ports, health,
-and active Compose inputs. Leave migrations `253`–`259`, outbox rows, and
+and active Compose inputs. Leave migrations `253`–`260`, outbox rows, and
 audit evidence in place; their down files deliberately abort and must never be
 used as an operational rollback. Do not delete receipts, outbox rows, secrets,
 source archives, image archives, or the previous release. If the preflight

@@ -220,7 +220,7 @@ BEGIN
     '253_strikeflow_response_outbox','254_strikeflow_connector_reply_command_unique',
     '255_strikeflow_response_outbox_event_unique','256_strikeflow_response_outbox_due_index',
     '257_strikeflow_response_outbox_event_id_unique','258_strikeflow_content_reply_connector',
-    '259_strikeflow_content_reply_receipt_unique');
+    '259_strikeflow_content_reply_receipt_unique','260_strikeflow_response_outbox_identity_immutable');
   IF versions IS DISTINCT FROM ARRAY[
     '253_strikeflow_response_outbox',
     '254_strikeflow_connector_reply_command_unique',
@@ -228,7 +228,8 @@ BEGIN
     '256_strikeflow_response_outbox_due_index',
     '257_strikeflow_response_outbox_event_id_unique',
     '258_strikeflow_content_reply_connector',
-    '259_strikeflow_content_reply_receipt_unique'
+    '259_strikeflow_content_reply_receipt_unique',
+    '260_strikeflow_response_outbox_identity_immutable'
   ]::text[] THEN RAISE EXCEPTION 'response migration ledger mismatch'; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='strikeflow_connector_reply_receipt' AND column_name='strikeflow_command_id' AND data_type='uuid' AND is_nullable='YES') THEN
     RAISE EXCEPTION 'receipt command column mismatch';
@@ -314,7 +315,8 @@ BEGIN
   THEN RAISE EXCEPTION 'response outbox exact check constraints mismatch'; END IF;
   IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.strikeflow_response_outbox'::regclass AND contype='f') THEN RAISE EXCEPTION 'response outbox must not contain foreign keys'; END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='strikeflow_reply_command_binding_immutable' AND tgrelid='public.strikeflow_connector_reply_receipt'::regclass AND tgfoid='public.reject_strikeflow_reply_command_binding_change()'::regprocedure AND tgtype=19 AND tgenabled='O' AND NOT tgisinternal)
-     OR (SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('public.strikeflow_connector_reply_receipt'::regclass,'public.strikeflow_response_outbox'::regclass) AND NOT tgisinternal) <> 1
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='strikeflow_response_outbox_identity_immutable' AND tgrelid='public.strikeflow_response_outbox'::regclass AND tgfoid='public.reject_strikeflow_response_outbox_identity_change()'::regprocedure AND tgtype=19 AND tgenabled='O' AND NOT tgisinternal)
+     OR (SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('public.strikeflow_connector_reply_receipt'::regclass,'public.strikeflow_response_outbox'::regclass) AND NOT tgisinternal) <> 2
   THEN RAISE EXCEPTION 'exact immutability trigger binding mismatch'; END IF;
   IF NOT EXISTS (
        SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
@@ -323,6 +325,14 @@ BEGIN
          AND p.provolatile='v' AND NOT p.prosecdef AND NOT p.proleakproof
          AND btrim(regexp_replace(p.prosrc,'[[:space:]]+',' ','g')) =
            'BEGIN IF NEW.strikeflow_command_id IS DISTINCT FROM OLD.strikeflow_command_id THEN RAISE EXCEPTION ''strikeflow command binding is immutable''; END IF; RETURN NEW; END;'
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
+       WHERE p.oid='public.reject_strikeflow_response_outbox_identity_change()'::regprocedure
+         AND l.lanname='plpgsql' AND p.prorettype='trigger'::regtype AND p.pronargs=0
+         AND p.provolatile='v' AND NOT p.prosecdef AND NOT p.proleakproof
+         AND btrim(regexp_replace(p.prosrc,'[[:space:]]+',' ','g')) =
+           'BEGIN IF ROW( NEW.event_id,NEW.event_type,NEW.strikeflow_command_id,NEW.workspace_key, NEW.workspace_id,NEW.project_id,NEW.issue_id,NEW.issue_identifier, NEW.inbox_item_id,NEW.root_comment_id,NEW.member_comment_id, NEW.continuation_task_id,NEW.recipient_id,NEW.agent_id, NEW.agent_comment_id,NEW.agent_comment_parent_id, NEW.agent_comment_content,NEW.agent_comment_type,NEW.occurred_at ) IS DISTINCT FROM ROW( OLD.event_id,OLD.event_type,OLD.strikeflow_command_id,OLD.workspace_key, OLD.workspace_id,OLD.project_id,OLD.issue_id,OLD.issue_identifier, OLD.inbox_item_id,OLD.root_comment_id,OLD.member_comment_id, OLD.continuation_task_id,OLD.recipient_id,OLD.agent_id, OLD.agent_comment_id,OLD.agent_comment_parent_id, OLD.agent_comment_content,OLD.agent_comment_type,OLD.occurred_at ) THEN RAISE EXCEPTION ''strikeflow response outbox identity is immutable''; END IF; RETURN NEW; END;'
      )
   THEN RAISE EXCEPTION 'immutability trigger function body mismatch'; END IF;
   IF EXISTS (SELECT event_id FROM public.strikeflow_response_outbox GROUP BY event_id HAVING count(*)>1) THEN RAISE EXCEPTION 'duplicate response event identity'; END IF;
