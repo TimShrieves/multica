@@ -7,6 +7,7 @@ adoption_manifest=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --before-start) mode=before-start; shift ;;
+    --migration-preflight) mode=migration-preflight; shift ;;
     --allow-delivered-outbox) outbox_policy=delivered; shift ;;
     --preserve-outbox) outbox_policy=preserve; shift ;;
     --allow-reconciled-pending-outbox)
@@ -18,7 +19,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 if [ "$#" -ne 3 ]; then
-  echo "usage: $0 [--before-start|--allow-delivered-outbox|--preserve-outbox|--allow-reconciled-pending-outbox MANIFEST] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
+  echo "usage: $0 [--before-start|--migration-preflight|--allow-delivered-outbox|--preserve-outbox|--allow-reconciled-pending-outbox MANIFEST] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
   exit 64
 fi
 
@@ -56,13 +57,19 @@ docker image inspect "$image_digest" --format '{{range .RepoDigests}}{{println .
 test "$(docker image inspect "$image_digest" --format '{{index .Config.Labels "co.strikeflow.response-publisher.source"}}')" = "$source_commit"
 test "$(docker image inspect "$image_digest" --format '{{index .Config.Labels "co.strikeflow.response-publisher.state"}}')" = dormant
 
-# Reuse the exact sealed catalog DO block from the enabled verifier so the
-# disabled candidate gate cannot drift to a weaker schema definition.
-test "$(grep -c '^DO \$\$$' "$catalog_source")" -eq 1
-test "$(grep -c '^SQL$' "$catalog_source")" -eq 1
-sed -n '/^DO \$\$$/,/^SQL$/p' "$catalog_source" | sed '$d' |
-  docker exec -i multica-postgres-1 sh -c \
-    'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+if [ "$mode" != migration-preflight ]; then
+  # Reuse the exact sealed catalog DO block from the enabled verifier so the
+  # disabled candidate gate cannot drift to a weaker schema definition. The
+  # migration-preflight mode is deliberately limited to the original
+  # base+pin identity and quiescence checks; it is used only immediately
+  # before the bounded mainline migration gate, which proves the post-state
+  # with this full catalog block.
+  test "$(grep -c '^DO \$\$$' "$catalog_source")" -eq 1
+  test "$(grep -c '^SQL$' "$catalog_source")" -eq 1
+  sed -n '/^DO \$\$$/,/^SQL$/p' "$catalog_source" | sed '$d' |
+    docker exec -i multica-postgres-1 sh -c \
+      'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+fi
 if [ "$outbox_policy" = empty ]; then
   outbox_count=$(docker exec -i multica-postgres-1 sh -c \
     'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox"')

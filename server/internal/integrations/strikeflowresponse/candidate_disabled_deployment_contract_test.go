@@ -44,6 +44,7 @@ func TestDisabledCandidateVerifierReusesExactCatalogAndRequiresEmptyOutbox(t *te
 		`stat -c '%U:%G %a' "$preflight_dir"`,
 		`! -user root -o ! -group root`,
 		`grep -c '^DO \$\$$'`,
+		"--migration-preflight",
 		`SELECT count(*) FROM strikeflow_response_outbox`,
 		`test "$outbox_count" = 0`,
 		`--allow-delivered-outbox`,
