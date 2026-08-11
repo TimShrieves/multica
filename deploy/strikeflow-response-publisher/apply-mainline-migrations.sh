@@ -88,8 +88,11 @@ printf '%s\n' "$predecessor_extras" | tr ' ' '\n' | LC_ALL=C sort >"$evidence_di
 
 find "$release_dir/server/migrations" -maxdepth 1 -type f -name '*.up.sql' -printf '%f\n' |
   sed 's/\.up\.sql$//' | LC_ALL=C sort >"$evidence_dir/migration-ledger.source"
-awk -v allow="$migration_allowlist" -v aliases="$(printf '%s' "$canonical_aliases" | tr ' ' ',')" '
-  BEGIN { n=split(allow,a,","); for (i=1;i<=n;i++) skip[a[i]]=1; n=split(aliases,a,","); for (i=1;i<=n;i++) skip[a[i]]=1 }
+awk -v allow="$migration_allowlist" '
+  # Canonical 253–257 aliases are already recorded by the predecessor gate
+  # and must remain in the expected-before ledger. Only the approved pending
+  # migration set is excluded here.
+  BEGIN { n=split(allow,a,","); for (i=1;i<=n;i++) skip[a[i]]=1 }
   !($0 in skip) { print }
 ' "$evidence_dir/migration-ledger.source" >"$evidence_dir/migration-ledger.expected-before"
 for version in $(cat "$evidence_dir/migration-allowlist"); do grep -Fx "$version" "$evidence_dir/migration-ledger.source" >/dev/null; done
