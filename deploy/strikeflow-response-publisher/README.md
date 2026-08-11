@@ -72,11 +72,14 @@ The sealed migration wrapper requires the fresh encrypted backup and checksum,
 uses a one-off `./migrate` container with no dependencies or published ports,
 and proves that every active container identity remained unchanged:
 
-On the current main lineage, this production wrapper is deliberately narrower
-than the clone rehearsal: it requires the complete release migration ledger
-through `257`, proves that `258`, `259`, and `260` are the only missing release migrations, and
-compares the complete ledger again after the one-off migrator exits. Any other
-pending or unexpected migration fails before the migrator is created.
+On the current main lineage, this production wrapper is deliberately explicit:
+the predecessor VPS is missing the unrelated mainline migrations `224`–`252`,
+so the approved readiness gate applies exactly `224`–`252` plus `258`, `259`,
+and `260`. It preserves the legacy `235_strikeflow_connector_principal` row
+and the five `900001`–`900005` predecessor rows, while normalizing those
+predecessors to the canonical `253`–`257` meanings for before/after comparison.
+No other migration may be selected, and the complete normalized ledger and
+response identity fingerprints must match after the one-off migrator exits.
 This includes installations whose catalog is equivalent but whose migration
 ledger uses the predecessor response lineage: the wrapper does not infer or
 write ledger aliases. Such a host requires a separately reviewed, approval-
@@ -118,12 +121,9 @@ reconcile-predecessor-ledger.sh RELEASE CURRENT_PREFLIGHT ENCRYPTED_BACKUP BACKU
   --confirm-reconcile
 ```
 
-After this gate, `258`, `259`, and `260` remain pending. Apply them through a
-separately captured fresh encrypted backup and migration evidence gate; do not
-call the normal wrapper until its preflight explicitly proves the aliased
-`253`–`257` ledger and the three remaining `258`–`260` rows are the only
-pending release migrations. The alias gate is not an activation or
-publisher-enable action.
+After this gate, `258`, `259`, and `260` remain pending. Apply the approved
+mainline set through the bounded wrapper below; the alias gate is not an
+activation or publisher-enable action.
 
 ### Mainline migration-gap gate
 
@@ -140,11 +140,17 @@ candidate. Never silently filter unrelated migrations merely to make `/readyz`
 pass.
 
 ```text
-apply-production-migrations.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
+apply-mainline-migrations.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
   ENCRYPTED_BACKUP BACKUP_SHA256 \
   /var/backups/multica-response-publisher/gate-a-<UTC>-<source> \
   --confirm-migrate
 ```
+
+`apply-production-migrations.sh` is retained only as a compatibility alias to
+this mainline-aware wrapper. It holds the shared response-producer advisory
+lock while the migrator runs, requires all publisher/dispatch/ongoing units to
+remain quiescent, passes the allowlist explicitly into the one-off container,
+and accepts the already-delivered outbox rows without permitting unsafe rows.
 
 After the catalog gate succeeds, deploy the candidate backend with the
 publisher exactly false and every response scope/key/floor blank. The disabled

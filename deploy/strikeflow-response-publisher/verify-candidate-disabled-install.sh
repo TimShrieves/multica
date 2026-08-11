@@ -4,16 +4,19 @@ set -eu
 mode=running
 outbox_policy=empty
 adoption_manifest=
-case "${1:-}" in
-  --before-start) mode=before-start; shift ;;
-  --allow-delivered-outbox) outbox_policy=delivered; shift ;;
-  --preserve-outbox) outbox_policy=preserve; shift ;;
-  --allow-reconciled-pending-outbox)
-    outbox_policy=adoption
-    adoption_manifest=${2:-}
-    shift 2
-    ;;
-esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --before-start) mode=before-start; shift ;;
+    --allow-delivered-outbox) outbox_policy=delivered; shift ;;
+    --preserve-outbox) outbox_policy=preserve; shift ;;
+    --allow-reconciled-pending-outbox)
+      outbox_policy=adoption
+      adoption_manifest=${2:-}
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 [--before-start|--allow-delivered-outbox|--preserve-outbox|--allow-reconciled-pending-outbox MANIFEST] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
   exit 64
