@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,21 +26,34 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	maxAttempts      = 12
+	attentionRetry   = 6 * time.Hour
 	maxResponseBytes = 10_000
 	requestTimeout   = 10 * time.Second
 	leaseDuration    = 30 * time.Second
 	pollInterval     = time.Second
 	recoveryInterval = 30 * time.Second
-	attentionRetry   = 6 * time.Hour
 )
 
 var keyIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+var requiredSecretOwnerUID uint32 = 0
 
 const responseWebhookPath = "/api/integrations/multica/content-delivery/responses"
+
+const (
+	protectedSTR94IssueID  = "b41bcb97-8b63-43f6-9d6c-4ee9e9ada891"
+	protectedSTR166IssueID = "39dcf540-bedf-4449-bc71-2e9e15fa0573"
+	protectedSTR172IssueID = "b1839f3d-97e5-449a-9059-21b3b393d096"
+)
+
+const (
+	AuthorizationModeExplicitCommands = "explicit_commands"
+	AuthorizationModeReceiptLineage   = "receipt_lineage"
+)
 
 // Config is intentionally exact and fail-closed. A publisher cannot be
 // enabled with a wildcard workspace, project, recipient, agent, or legacy
@@ -51,36 +66,109 @@ type Config struct {
 	WorkspaceID  string
 	WorkspaceKey string
 	ProjectIDs   []string
-	RecipientID  string
-	AgentID      string
-	STR94IssueID string
-	NotBefore    time.Time
-	HTTPClient   *http.Client
-	Now          func() time.Time
+	// AuthorizationMode chooses whether recovery is constrained to an
+	// operator-maintained command allowlist or to every post-floor receipt
+	// that satisfies the same exact connector lineage and scope joins.
+	AuthorizationMode string
+	CommandIDs        []string
+	RecipientID       string
+	AgentID           string
+	STR94IssueID      string
+	ExcludedIssueIDs  []string
+	NotBefore         time.Time
+	HTTPClient        *http.Client
+	Now               func() time.Time
 }
 
 func ConfigFromEnv() (Config, error) {
 	enabled := strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED")) == "true"
 	config := Config{Enabled: enabled}
+	if os.Getenv("STRIKEFLOW_RESPONSE_HMAC_SECRET") != "" {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET is forbidden; use STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE")
+	}
 	if !enabled {
 		return config, nil
 	}
 	config.WebhookURL = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_WEBHOOK_URL"))
-	config.HMACSecret = os.Getenv("STRIKEFLOW_RESPONSE_HMAC_SECRET")
+	secretFile := strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE"))
+	if !filepath.IsAbs(secretFile) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must be an absolute path")
+	}
+	secretFD, err := unix.Open(secretFile, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return config, fmt.Errorf("open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE without following symlinks: %w", err)
+	}
+	secretHandle := os.NewFile(uintptr(secretFD), secretFile)
+	if secretHandle == nil {
+		_ = unix.Close(secretFD)
+		return config, errors.New("open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE returned an invalid descriptor")
+	}
+	defer secretHandle.Close()
+	secretInfo, err := secretHandle.Stat()
+	if err != nil {
+		return config, fmt.Errorf("stat open STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE: %w", err)
+	}
+	secretStat, ok := secretInfo.Sys().(*syscall.Stat_t)
+	if !ok || !secretInfo.Mode().IsRegular() || secretInfo.Mode().Perm() != 0o600 || secretStat.Uid != requiredSecretOwnerUID {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must be a regular root-owned mode-0600 file")
+	}
+	secret, err := io.ReadAll(io.LimitReader(secretHandle, 4097))
+	if err != nil {
+		return config, fmt.Errorf("read STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE: %w", err)
+	}
+	if len(secret) > 4096 {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must not exceed 4096 bytes")
+	}
+	config.HMACSecret = string(secret)
+	if config.HMACSecret != strings.TrimSpace(config.HMACSecret) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE must not contain surrounding whitespace")
+	}
 	config.HMACKeyID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_HMAC_KEY_ID"))
 	config.WorkspaceID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_WORKSPACE_ID"))
 	config.WorkspaceKey = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_WORKSPACE_KEY"))
 	config.ProjectIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_PROJECT_IDS"))
+	config.AuthorizationMode = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE"))
+	config.CommandIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_COMMAND_IDS"))
 	config.RecipientID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_RECIPIENT_ID"))
 	config.AgentID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_AGENT_ID"))
 	config.STR94IssueID = strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_STR94_ISSUE_ID"))
+	config.ExcludedIssueIDs = splitExactList(os.Getenv("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS"))
+	if config.STR94IssueID != protectedSTR94IssueID || !sameStringSet(config.ExcludedIssueIDs, []string{
+		protectedSTR94IssueID, protectedSTR166IssueID, protectedSTR172IssueID,
+	}) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS must exactly protect STR-94, STR-166, and STR-172")
+	}
 	notBefore := strings.TrimSpace(os.Getenv("STRIKEFLOW_RESPONSE_NOT_BEFORE"))
 	parsedNotBefore, err := time.Parse(time.RFC3339, notBefore)
 	if err != nil {
 		return config, errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE must be an exact RFC3339 timestamp")
 	}
 	config.NotBefore = parsedNotBefore
+	if config.NotBefore.After(time.Now().UTC()) {
+		return config, errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE must not be in the future")
+	}
 	return config, config.Validate()
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	want := make(map[string]struct{}, len(right))
+	for _, value := range right {
+		want[value] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		if _, ok := want[value]; !ok {
+			return false
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return len(seen) == len(want)
 }
 
 func splitExactList(value string) []string {
@@ -122,9 +210,28 @@ func (c Config) Validate() error {
 	if c.NotBefore.IsZero() {
 		return errors.New("STRIKEFLOW_RESPONSE_NOT_BEFORE is required when the publisher is enabled")
 	}
+	if c.STR94IssueID != protectedSTR94IssueID || !sameStringSet(c.ExcludedIssueIDs, []string{
+		protectedSTR94IssueID, protectedSTR166IssueID, protectedSTR172IssueID,
+	}) {
+		return errors.New("STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS must exactly protect STR-94, STR-166, and STR-172")
+	}
 	ids := append([]string{c.WorkspaceID, c.RecipientID, c.AgentID, c.STR94IssueID}, c.ProjectIDs...)
+	ids = append(ids, c.ExcludedIssueIDs...)
 	if len(c.ProjectIDs) == 0 || len(c.ProjectIDs) > 32 {
 		return errors.New("STRIKEFLOW_RESPONSE_PROJECT_IDS must contain 1-32 exact project UUIDs")
+	}
+	switch c.AuthorizationMode {
+	case AuthorizationModeExplicitCommands:
+		if len(c.CommandIDs) == 0 || len(c.CommandIDs) > 32 {
+			return errors.New("STRIKEFLOW_RESPONSE_COMMAND_IDS must contain 1-32 exact command UUIDs in explicit_commands mode")
+		}
+		ids = append(ids, c.CommandIDs...)
+	case AuthorizationModeReceiptLineage:
+		if len(c.CommandIDs) != 0 {
+			return errors.New("STRIKEFLOW_RESPONSE_COMMAND_IDS must be empty in receipt_lineage mode")
+		}
+	default:
+		return errors.New("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE must be explicit_commands or receipt_lineage")
 	}
 	for _, value := range ids {
 		if _, err := uuid.Parse(value); err != nil {
@@ -132,6 +239,13 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) excludedIssueIDs() []string {
+	if len(c.ExcludedIssueIDs) > 0 {
+		return c.ExcludedIssueIDs
+	}
+	return []string{c.STR94IssueID}
 }
 
 type Publisher struct {
@@ -233,14 +347,14 @@ func (p *Publisher) RecoverOnce(ctx context.Context) error {
 	}
 	if _, err := p.pool.Exec(ctx, recoverAgentCommentsSQL,
 		p.config.WorkspaceID, p.config.ProjectIDs, p.config.RecipientID,
-		p.config.AgentID, p.config.STR94IssueID, maxResponseBytes, p.config.WorkspaceKey,
-		p.config.NotBefore); err != nil {
+		p.config.AgentID, p.config.excludedIssueIDs(), maxResponseBytes, p.config.WorkspaceKey,
+		p.config.NotBefore, p.config.AuthorizationMode, p.config.CommandIDs); err != nil {
 		return fmt.Errorf("recover agent comments: %w", err)
 	}
 	if _, err := p.pool.Exec(ctx, recoverTaskCompletionsSQL,
 		p.config.WorkspaceID, p.config.ProjectIDs, p.config.RecipientID,
-		p.config.AgentID, p.config.STR94IssueID, p.config.WorkspaceKey,
-		p.config.NotBefore); err != nil {
+		p.config.AgentID, p.config.excludedIssueIDs(), p.config.WorkspaceKey,
+		p.config.NotBefore, p.config.AuthorizationMode, p.config.CommandIDs); err != nil {
 		return fmt.Errorf("recover task completions: %w", err)
 	}
 	return nil
@@ -262,6 +376,12 @@ JOIN strikeflow_connector_reply_receipt rr
 JOIN strikeflow_connector_token t ON t.id=rr.token_id
 JOIN issue i ON i.id=q.issue_id AND i.workspace_id=c.workspace_id
 JOIN workspace w ON w.id=i.workspace_id
+JOIN comment member
+  ON member.id=rr.comment_id AND member.issue_id=i.id AND member.workspace_id=i.workspace_id
+  AND member.parent_id=rr.root_comment_id AND member.author_type='member'
+  AND member.author_id=t.recipient_id
+JOIN comment root
+  ON root.id=rr.root_comment_id AND root.issue_id=i.id AND root.workspace_id=i.workspace_id
 WHERE c.author_type='agent'
   AND i.workspace_id=$1::uuid
   AND i.project_id=ANY($2::uuid[])
@@ -273,21 +393,30 @@ WHERE c.author_type='agent'
   AND q.originator_source='direct_human'
   AND q.trigger_evidence_kind='comment'
   AND q.trigger_evidence_ref_id=rr.comment_id
-  AND i.id<>$5::uuid
+  AND i.id<>ALL($5::uuid[])
   AND octet_length(c.content)<=$6
   AND rr.strikeflow_command_id IS NOT NULL
+  AND ($9::text='receipt_lineage' OR rr.strikeflow_command_id=ANY($10::uuid[]))
   AND rr.created_at >= $8::timestamptz
   AND rr.committed_at >= $8::timestamptz
   AND c.created_at >= $8::timestamptz
+  AND (
+      SELECT count(*) FROM comment prior
+      WHERE prior.source_task_id=q.id
+        AND prior.author_type='agent' AND prior.author_id=q.agent_id
+        AND (prior.created_at,prior.id)<=(c.created_at,c.id)
+  ) <= 100
   AND EXISTS (
-      WITH RECURSIVE ancestors(id) AS (
-          SELECT c.parent_id
+      WITH RECURSIVE canonical_chain(id,parent_id) AS (
+          SELECT c.id,c.parent_id
           UNION ALL
-          SELECT parent.parent_id
-          FROM comment parent JOIN ancestors a ON parent.id=a.id
+          SELECT parent.id,parent.parent_id
+          FROM comment parent JOIN canonical_chain child ON parent.id=child.parent_id
           WHERE parent.issue_id=i.id AND parent.workspace_id=i.workspace_id
+            AND parent.author_type='agent' AND parent.author_id=q.agent_id
+            AND parent.source_task_id=q.id
       )
-      SELECT 1 FROM ancestors WHERE id=rr.comment_id
+      SELECT 1 FROM canonical_chain WHERE parent_id=rr.comment_id
   )
 ON CONFLICT DO NOTHING`
 
@@ -305,6 +434,12 @@ JOIN strikeflow_connector_reply_receipt rr
 JOIN strikeflow_connector_token t ON t.id=rr.token_id
 JOIN issue i ON i.id=q.issue_id
 JOIN workspace w ON w.id=i.workspace_id
+JOIN comment member
+  ON member.id=rr.comment_id AND member.issue_id=i.id AND member.workspace_id=i.workspace_id
+  AND member.parent_id=rr.root_comment_id AND member.author_type='member'
+  AND member.author_id=t.recipient_id
+JOIN comment root
+  ON root.id=rr.root_comment_id AND root.issue_id=i.id AND root.workspace_id=i.workspace_id
 WHERE q.status='completed' AND q.completed_at IS NOT NULL
   AND i.workspace_id=$1::uuid
   AND i.project_id=ANY($2::uuid[])
@@ -316,11 +451,17 @@ WHERE q.status='completed' AND q.completed_at IS NOT NULL
   AND q.originator_source='direct_human'
   AND q.trigger_evidence_kind='comment'
   AND q.trigger_evidence_ref_id=rr.comment_id
-  AND i.id<>$5::uuid
+  AND i.id<>ALL($5::uuid[])
   AND rr.strikeflow_command_id IS NOT NULL
+  AND ($8::text='receipt_lineage' OR rr.strikeflow_command_id=ANY($9::uuid[]))
   AND rr.created_at >= $7::timestamptz
   AND rr.committed_at >= $7::timestamptz
   AND q.completed_at >= $7::timestamptz
+  AND (
+      SELECT count(*) FROM comment response
+      WHERE response.source_task_id=q.id
+        AND response.author_type='agent' AND response.author_id=q.agent_id
+  ) <= 100
 ON CONFLICT DO NOTHING`
 
 type outboxRow struct {
@@ -382,6 +523,46 @@ func (row outboxRow) payload() eventPayload {
 	return payload
 }
 
+const deliverCandidateSQL = `
+WITH candidate AS (
+    SELECT o.event_id FROM strikeflow_response_outbox o
+    WHERE o.delivered_at IS NULL
+      AND o.next_attempt_at<=now() AND (o.lease_until IS NULL OR o.lease_until<now())
+      AND (
+        (o.event_type='agent_comment.created' AND (
+          o.agent_comment_parent_id=o.member_comment_id
+          OR EXISTS (
+            SELECT 1 FROM strikeflow_response_outbox parent
+            WHERE parent.strikeflow_command_id=o.strikeflow_command_id
+              AND parent.continuation_task_id=o.continuation_task_id
+              AND parent.event_type='agent_comment.created'
+              AND parent.agent_comment_id=o.agent_comment_parent_id
+              AND parent.delivered_at IS NOT NULL
+          )
+        ))
+        OR (o.event_type='task.completed' AND NOT EXISTS (
+          SELECT 1 FROM strikeflow_response_outbox comment
+          WHERE comment.strikeflow_command_id=o.strikeflow_command_id
+            AND comment.continuation_task_id=o.continuation_task_id
+            AND comment.event_type='agent_comment.created'
+            AND comment.delivered_at IS NULL
+        ))
+      )
+    ORDER BY o.occurred_at,
+      CASE WHEN o.event_type='task.completed' THEN 1 ELSE 0 END,
+      o.event_id
+    FOR UPDATE SKIP LOCKED LIMIT 1
+)
+UPDATE strikeflow_response_outbox o
+SET lease_until=now()+$1::interval,attempt_count=attempt_count+1
+FROM candidate WHERE o.event_id=candidate.event_id
+RETURNING o.event_id::text,o.event_type,o.strikeflow_command_id::text,o.workspace_key,
+  o.workspace_id::text,o.project_id::text,
+  o.issue_id::text,o.issue_identifier,o.inbox_item_id::text,o.root_comment_id::text,
+  o.member_comment_id::text,o.continuation_task_id::text,o.recipient_id::text,o.agent_id::text,
+  o.agent_comment_id::text,o.agent_comment_parent_id::text,o.agent_comment_content,
+  o.agent_comment_type,o.occurred_at,o.attempt_count`
+
 func (p *Publisher) DeliverOnce(ctx context.Context) (bool, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -389,24 +570,7 @@ func (p *Publisher) DeliverOnce(ctx context.Context) (bool, error) {
 	}
 	defer tx.Rollback(ctx)
 	row := outboxRow{}
-	err = tx.QueryRow(ctx, `
-        WITH candidate AS (
-            SELECT event_id FROM strikeflow_response_outbox
-            WHERE delivered_at IS NULL
-              AND next_attempt_at<=now() AND (lease_until IS NULL OR lease_until<now())
-            ORDER BY next_attempt_at,created_at
-            FOR UPDATE SKIP LOCKED LIMIT 1
-        )
-        UPDATE strikeflow_response_outbox o
-        SET lease_until=now()+$1::interval,attempt_count=attempt_count+1
-        FROM candidate WHERE o.event_id=candidate.event_id
-        RETURNING o.event_id::text,o.event_type,o.strikeflow_command_id::text,o.workspace_key,
-          o.workspace_id::text,o.project_id::text,
-          o.issue_id::text,o.issue_identifier,o.inbox_item_id::text,o.root_comment_id::text,
-          o.member_comment_id::text,o.continuation_task_id::text,o.recipient_id::text,o.agent_id::text,
-          o.agent_comment_id::text,o.agent_comment_parent_id::text,o.agent_comment_content,
-          o.agent_comment_type,o.occurred_at,o.attempt_count
-    `, leaseDuration.String()).Scan(
+	err = tx.QueryRow(ctx, deliverCandidateSQL, leaseDuration.String()).Scan(
 		&row.EventID, &row.EventType, &row.CommandID, &row.WorkspaceKey,
 		&row.WorkspaceID, &row.ProjectID,
 		&row.IssueID, &row.IssueIdentifier, &row.InboxItemID, &row.RootCommentID,
@@ -426,13 +590,13 @@ func (p *Publisher) DeliverOnce(ctx context.Context) (bool, error) {
 
 	body, err := json.Marshal(row.payload())
 	if err != nil {
-		return true, p.retry(ctx, row, err)
+		return true, p.attention(ctx, row, err)
 	}
 	timestamp := fmt.Sprintf("%d", p.config.Now().Unix())
 	signature := Sign(p.config.HMACSecret, timestamp, body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.config.WebhookURL, bytes.NewReader(body))
 	if err != nil {
-		return true, p.retry(ctx, row, err)
+		return true, p.attention(ctx, row, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Multica-Event-ID", row.EventID)
@@ -444,9 +608,19 @@ func (p *Publisher) DeliverOnce(ctx context.Context) (bool, error) {
 		return true, p.retry(ctx, row, err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return true, p.retry(ctx, row, fmt.Errorf("StrikeFlow webhook returned HTTP %d", resp.StatusCode))
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4097))
+	if readErr != nil {
+		return true, p.retry(ctx, row, fmt.Errorf("read StrikeFlow webhook response: %w", readErr))
+	}
+	if resp.StatusCode != http.StatusOK {
+		cause := fmt.Errorf("StrikeFlow webhook returned HTTP %d", resp.StatusCode)
+		if isTransientStatus(resp.StatusCode) {
+			return true, p.retry(ctx, row, cause)
+		}
+		return true, p.attention(ctx, row, cause)
+	}
+	if !validAcknowledgement(responseBody, row.EventID) {
+		return true, p.attention(ctx, row, errors.New("StrikeFlow webhook returned an invalid acknowledgement"))
 	}
 	_, err = p.pool.Exec(ctx, `
         UPDATE strikeflow_response_outbox
@@ -454,6 +628,19 @@ func (p *Publisher) DeliverOnce(ctx context.Context) (bool, error) {
         WHERE event_id=$1 AND delivered_at IS NULL
     `, row.EventID)
 	return true, err
+}
+
+func validAcknowledgement(body []byte, eventID string) bool {
+	if len(body) > 4096 {
+		return false
+	}
+	var ack struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			EventID string `json:"event_id"`
+		} `json:"data"`
+	}
+	return json.Unmarshal(body, &ack) == nil && ack.OK && ack.Data.EventID == eventID
 }
 
 func (p *Publisher) retry(ctx context.Context, row outboxRow, cause error) error {
@@ -471,7 +658,8 @@ func (p *Publisher) retry(ctx context.Context, row outboxRow, cause error) error
 		if err == nil && tag.RowsAffected() == 1 && row.AttemptCount == maxAttempts {
 			slog.Warn("strikeflow response delivery entered needs-attention retry",
 				"event_id", row.EventID, "attempt_count", row.AttemptCount,
-				"next_retry_in", attentionRetry.String(), "error", message)
+				"next_retry_in", attentionRetry.String(),
+				"error", message)
 		}
 		return err
 	}
@@ -482,6 +670,25 @@ func (p *Publisher) retry(ctx context.Context, row outboxRow, cause error) error
         WHERE event_id=$1 AND delivered_at IS NULL
     `, row.EventID, delay.String(), message)
 	return err
+}
+
+func (p *Publisher) attention(ctx context.Context, row outboxRow, cause error) error {
+	message := cause.Error()
+	if len(message) > 1000 {
+		message = message[:1000]
+	}
+	_, err := p.pool.Exec(ctx, `
+        UPDATE strikeflow_response_outbox
+        SET needs_attention_at=COALESCE(needs_attention_at,now()),
+            lease_until=NULL,last_error=$2
+        WHERE event_id=$1 AND delivered_at IS NULL
+    `, row.EventID, message)
+	return err
+}
+
+func isTransientStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
+		status == http.StatusTooManyRequests || status >= 500
 }
 
 func retryDelay(attempt int) time.Duration {

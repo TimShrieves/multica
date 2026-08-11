@@ -2872,7 +2872,7 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 	// task inside the completion transaction below. It is broadcast (chat:done)
 	// only after the transaction commits.
 	var chatAssistantMsg *db.ChatMessage
-	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+	if err := s.runResponseProducerInTx(ctx, func(qtx *db.Queries) error {
 		t, err := qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
 			ID:                    taskID,
 			Result:                result,
@@ -4082,6 +4082,28 @@ func (s *TaskService) runInTx(ctx context.Context, fn func(*db.Queries) error) e
 	return tx.Commit(ctx)
 }
 
+// runResponseProducerInTx is the narrow transaction wrapper for writes that
+// can become eligible response-lineage source rows. The adoption gate holds
+// the matching session-level advisory lock while it snapshots and recreates
+// the publisher, so no producer can enter during that transition.
+func (s *TaskService) runResponseProducerInTx(ctx context.Context, fn func(*db.Queries) error) error {
+	if s.TxStarter == nil {
+		return fn(s.Queries)
+	}
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin response producer tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := util.LockResponseProducer(ctx, tx); err != nil {
+		return fmt.Errorf("lock response producer: %w", err)
+	}
+	if err := fn(s.Queries.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ReportProgress broadcasts a progress update via the event bus.
 func (s *TaskService) ReportProgress(ctx context.Context, taskID string, workspaceID string, summary string, step, total int) {
 	s.Bus.Publish(events.Event{
@@ -4546,15 +4568,20 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 			rootComment = &root
 		}
 	}
-	comment, err := s.Queries.CreateComment(ctx, db.CreateCommentParams{
-		IssueID:      issueID,
-		WorkspaceID:  issue.WorkspaceID,
-		AuthorType:   "agent",
-		AuthorID:     agentID,
-		Content:      content,
-		Type:         commentType,
-		ParentID:     parentID,
-		SourceTaskID: sourceTaskID,
+	var comment db.Comment
+	err = s.runResponseProducerInTx(ctx, func(qtx *db.Queries) error {
+		var createErr error
+		comment, createErr = qtx.CreateComment(ctx, db.CreateCommentParams{
+			IssueID:      issueID,
+			WorkspaceID:  issue.WorkspaceID,
+			AuthorType:   "agent",
+			AuthorID:     agentID,
+			Content:      content,
+			Type:         commentType,
+			ParentID:     parentID,
+			SourceTaskID: sourceTaskID,
+		})
+		return createErr
 	})
 	if err != nil {
 		return

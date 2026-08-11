@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_strikeflow_response_outbox_event_id_unique ON strikeflow_response_outbox (event_id);
