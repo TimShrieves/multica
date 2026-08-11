@@ -65,6 +65,39 @@ approval gate. Take a fresh encrypted database backup and root-only host
 preflight immediately before production application. All five down migrations
 intentionally abort.
 
+The sealed migration wrapper requires the fresh encrypted backup and checksum,
+uses a one-off `./migrate` container with no dependencies or published ports,
+and proves that every active container identity remained unchanged:
+
+```text
+apply-production-migrations.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
+  ENCRYPTED_BACKUP BACKUP_SHA256 \
+  /var/backups/multica-response-publisher/gate-a-<UTC>-<source> \
+  --confirm-migrate
+```
+
+After the catalog gate succeeds, deploy the candidate backend with the
+publisher exactly false and every response scope/key/floor blank. The disabled
+overlay uses direct `./server`, has no HMAC interpolation or mount, and is
+reboot-persistent through the backend container's existing restart policy:
+
+```text
+deploy-candidate-disabled.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
+  /var/backups/multica-response-publisher/candidate-disabled-<UTC>-<source> \
+  --confirm-deploy-disabled
+verify-candidate-disabled-install.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT
+```
+
+Before enablement, a fresh `STARTING_PREFLIGHT` must capture that exact running
+disabled candidate. A pre-canary rollback restores the original base+pin
+backend while preserving the additive schema and evidence:
+
+```text
+rollback-candidate-disabled.sh RELEASE ORIGINAL_PREFLIGHT \
+  /var/backups/multica-response-publisher/rollback-candidate-disabled-<UTC>-<source> \
+  --confirm-rollback-disabled
+```
+
 Activation must use the exact image digest recorded in `ARTIFACTS`, one exact
 authorization mode, one workspace/project/recipient/agent scope, a fresh
 not-before floor, and a dedicated root-owned `0600` HMAC secret file of at
@@ -76,6 +109,13 @@ The candidate backend must first be deployed with the publisher false, before
 the fresh reply is created, so the receipt records its command UUID. Do not
 reuse a receipt created by the legacy backend because its command binding is
 null and permanently ineligible.
+
+Keep two distinct, root-only preflights for activation. `ORIGINAL_PREFLIGHT`
+is captured before the candidate-disabled deployment and is authoritative only
+for restoring the original base+pin backend. `STARTING_PREFLIGHT` is captured
+after that disabled candidate is healthy and immediately before enablement; it
+is authoritative for current runtime identity and activation verification.
+Never use one directory for both roles.
 
 Compose file and environment order is a safety boundary:
 
@@ -92,8 +132,10 @@ After the five migrations and receiver gate are separately approved, stage the
 exact enabled config and secret, then run:
 
 ```text
-verify-enabled-install.sh --before-start RELEASE IMAGE_DIGEST PREFLIGHT
-activate.sh RELEASE IMAGE_DIGEST PREFLIGHT \
+verify-candidate-disabled-install.sh --allow-delivered-outbox \
+  RELEASE IMAGE_DIGEST STARTING_PREFLIGHT
+verify-enabled-install.sh --before-start RELEASE IMAGE_DIGEST STARTING_PREFLIGHT
+activate.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT STARTING_PREFLIGHT \
   /var/backups/multica-response-publisher/activation-<UTC>-<source> \
   --confirm-activate
 ```
@@ -103,6 +145,9 @@ and authorization mode, rendered Compose semantics, production catalog, active
 container identities, restart policy, mount, config-file ordering, and absence
 of any `needs_attention` outbox row. The
 activation script refuses to apply migrations and recreates only the backend.
+Both the candidate-disabled and activation overlays use the direct `./server`
+entrypoint, bypassing the image entrypoint that invokes migrations. SQL remains
+a separate, explicitly approved gate; activation and safe-off never invoke it.
 It writes root-only checksummed evidence and requires `/readyz` plus the strict
 post-start verifier.
 
@@ -116,9 +161,12 @@ same two env sources and three files in the exact order above.
 ## Evidence-preserving rollback
 
 Rollback always recreates the candidate with the publisher false first; merely
-editing an environment file does not change a running container. Restore the
-exact pre-activation backend image and disabled response environment from the
-named preflight, then
+editing an environment file does not change a running container. That first
+safe-off recreate uses the sealed disabled overlay, direct `./server`, and no
+HMAC mount. Verify the
+activated candidate against `STARTING_PREFLIGHT`, then restore the exact
+original backend image and disabled response environment exclusively from
+`ORIGINAL_PREFLIGHT`, then
 recreate only the backend container and verify its image digest, ports, health,
 and active Compose inputs. Leave migrations `900001`–`900005`, outbox rows, and
 audit evidence in place; their down files deliberately abort and must never be
@@ -127,7 +175,7 @@ source archives, image archives, or the previous release. If the preflight
 identity or checksum differs, stop instead of guessing.
 
 ```text
-rollback-activated.sh RELEASE PREFLIGHT \
+rollback-activated.sh RELEASE ORIGINAL_PREFLIGHT STARTING_PREFLIGHT \
   /var/backups/multica-response-publisher/rollback-<UTC>-<source> \
   --confirm-rollback
 ```
@@ -135,8 +183,9 @@ rollback-activated.sh RELEASE PREFLIGHT \
 The script first verifies the currently running candidate image, exact
 three-file Compose identity, enabled environment, secret mount, and catalog
 before it mutates anything. It preserves the enabled and safe-off environments
-in a root-only evidence directory, restores the original two-file Compose project, requires
-the exact preflight backend image and `/readyz`, and only then restores the
+in a root-only evidence directory, records both preflight paths, restores the
+original two-file Compose project, requires the exact original-preflight backend
+image and `/readyz`, and only then restores the
 tracked blank disabled environment. Disable the StrikeFlow receiver after the
 publisher is proven false. Do not remove the HMAC file or database evidence.
 

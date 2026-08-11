@@ -138,6 +138,8 @@ image, secret = sys.argv[1:]
 backend = config["services"]["backend"]
 if backend.get("image") != image:
     raise SystemExit("rendered backend image is not the sealed digest")
+if backend.get("entrypoint") != ["./server"]:
+    raise SystemExit("enabled publisher must bypass the migration entrypoint")
 env = backend.get("environment", {})
 if env.get("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED") != "true":
     raise SystemExit("rendered publisher is not enabled")
@@ -155,6 +157,7 @@ else
   test "$(docker inspect multica-backend-1 --format '{{.Image}}')" = "$image_id"
   test "$(docker inspect multica-backend-1 --format '{{.State.Running}}')" = true
   test "$(docker inspect multica-backend-1 --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped
+  test "$(docker inspect multica-backend-1 --format '{{json .Config.Entrypoint}}')" = '["./server"]'
   expected_ports=$(cut -d'|' -f4 "$preflight_dir/multica-backend-1.identity")
   test "$(docker inspect multica-backend-1 --format '{{json .NetworkSettings.Ports}}')" = "$expected_ports"
   wget -q -O /dev/null http://127.0.0.1:8080/health

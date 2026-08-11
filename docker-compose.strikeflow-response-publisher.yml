@@ -9,6 +9,9 @@ services:
     # required expansion prevents this overlay from silently starting the old
     # pinned backend image.
     image: ${STRIKEFLOW_RESPONSE_BACKEND_IMAGE:?set the sealed candidate image digest}
+    # Migrations are an independently approved production gate. Candidate
+    # activation and safe-off recreates must bypass the image entrypoint.
+    entrypoint: ["./server"]
     environment:
       STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED: ${STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED:-false}
       STRIKEFLOW_RESPONSE_WEBHOOK_URL: ${STRIKEFLOW_RESPONSE_WEBHOOK_URL:-}

@@ -53,6 +53,7 @@ func TestDormantDeploymentContractCarriesActivationOnlyHostPath(t *testing.T) {
 		"STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS",
 		"${STRIKEFLOW_RESPONSE_HMAC_HOST_FILE:?set the dedicated HMAC secret file}",
 		"/run/secrets/strikeflow_response_hmac:ro",
+		`entrypoint: ["./server"]`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("activation overlay missing %q", required)
@@ -70,7 +71,29 @@ func TestActivationScriptCannotBecomeTheMigrationApprovalGate(t *testing.T) {
 	if strings.Contains(text, "migrate up") || strings.Contains(text, "migrate down") {
 		t.Fatal("activation script must not apply or reverse migrations")
 	}
-	for _, required := range []string{"fail_closed", "publisher.env.safe-off", "activation_verified=false", "fail-closed-fallback.log", "assert_original_backend", "restored_image_ref", "/run/secrets/strikeflow_response_hmac"} {
+	for _, required := range []string{
+		"original_preflight",
+		"flock -n",
+		"starting_preflight",
+		`test "$original_preflight" != "$starting_preflight"`,
+		"verify-candidate-disabled-install.sh",
+		`--before-start "$release_dir" "$image_digest" "$starting_preflight"`,
+		"original-preflight.txt",
+		"starting-preflight.txt",
+		"assert_activation_overlay",
+		`backend.get("entrypoint") != ["./server"]`,
+		"disabled_overlay",
+		"--allow-delivered-outbox",
+		"fail_closed",
+		"publisher.env.safe-off",
+		"activation_verified=false",
+		"fail-closed-fallback.log",
+		"SHA256SUMS",
+		"fallback_status=not_attempted",
+		"assert_original_backend",
+		"restored_image_ref",
+		"/run/secrets/strikeflow_response_hmac",
+	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("activation script is missing fail-closed contract %q", required)
 		}
@@ -104,7 +127,26 @@ func TestRollbackVerifiesActivatedIdentityBeforeMutation(t *testing.T) {
 	if verify < 0 || recreateAfterVerify < 0 {
 		t.Fatal("rollback must verify the activated identity before any backend recreate")
 	}
-	for _, required := range []string{"restored_image_ref", "assert_original_backend", "restore_original_backend", "failure-restore-original.log"} {
+	for _, required := range []string{
+		"original_preflight",
+		"flock -n",
+		"starting_preflight",
+		`test "$original_preflight" != "$starting_preflight"`,
+		`--rollback-preflight "$release_dir" "$image_digest" "$starting_preflight"`,
+		`expected_image=$(cut -d'|' -f2 "$original_preflight/multica-backend-1.identity")`,
+		`sha256sum -c "$original_preflight/active-compose.sha256"`,
+		"original-preflight.txt",
+		"starting-preflight.txt",
+		"assert_activation_overlay",
+		`backend.get("entrypoint") != ["./server"]`,
+		"disabled_overlay",
+		"--allow-delivered-outbox",
+		"restored_image_ref",
+		"assert_original_backend",
+		"restore_original_backend",
+		"failure-restore-original.log",
+		"SHA256SUMS",
+	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("rollback is missing original-backend safety contract %q", required)
 		}
@@ -137,6 +179,8 @@ func TestEnabledVerifierChecksExactImmutabilitySemantics(t *testing.T) {
 	text := string(verifier)
 	for _, required := range []string{
 		"len(raw) > 4096",
+		`backend.get("entrypoint") != ["./server"]`,
+		`Config.Entrypoint`,
 		"regexp_replace(pg_get_constraintdef",
 		"column_default='gen_random_uuid()'",
 		"column_default='0'",
