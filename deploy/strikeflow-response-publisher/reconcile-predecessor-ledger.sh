@@ -87,7 +87,10 @@ docker inspect multica-backend-1 --format '{{json .Config.Env}}' |
 import json, sys
 env = dict(item.split("=", 1) for item in json.load(sys.stdin) if "=" in item)
 response = {k: v for k, v in env.items() if k.startswith("STRIKEFLOW_RESPONSE_")}
-if response.pop("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", None) != "false" or any(response.values()):
+# The original base+pin runtime predates the response overlay and therefore
+# has no STRIKEFLOW_RESPONSE_* variables at all. Accept that dormant shape;
+# when response variables are present, require the exact disabled contract.
+if response and (response.pop("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", None) != "false" or any(response.values())):
     raise SystemExit("publisher must remain disabled during ledger reconciliation")
 '
 docker inspect multica-backend-1 --format '{{json .Mounts}}' |

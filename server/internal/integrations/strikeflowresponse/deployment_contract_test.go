@@ -504,6 +504,18 @@ func TestPredecessorReconcileAllowsStaticDormantUnits(t *testing.T) {
 	}
 }
 
+func TestPredecessorReconcileAcceptsOriginalBaseEnv(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "reconcile-predecessor-ledger.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(script)
+	if !strings.Contains(s, `if response and (response.pop("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", None) != "false"`) {
+		t.Fatal("predecessor reconciler must accept an absent response environment on original base+pin")
+	}
+}
+
 func TestReplayUtilityUsesSealedBinaryAndNeverMutatesOutbox(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "replay-delivered-comment.sh"))
