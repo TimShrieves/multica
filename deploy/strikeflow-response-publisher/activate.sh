@@ -64,6 +64,12 @@ restore_original_backend() {
   assert_original_backend
 }
 
+install_disabled_config() {
+  disabled_tmp=$(mktemp /etc/multica-response-publisher/publisher.env.disabled.XXXXXX)
+  install -o root -g root -m 0600 "$disabled_env" "$disabled_tmp"
+  mv "$disabled_tmp" "$config_file"
+}
+
 evidence_parent=$(readlink -f "$(dirname "$evidence_dir")")
 evidence_name=$(basename "$evidence_dir")
 test "$evidence_parent" = /var/backups/multica-response-publisher
@@ -116,7 +122,8 @@ backend_changed=false
 activation_verified=false
 fail_closed() {
   status=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ "$backend_changed" = true ] && [ "$activation_verified" != true ]; then
     set +e
     # First return to the sealed disabled candidate without the HMAC mount.
@@ -141,10 +148,12 @@ fail_closed() {
       assert_original_backend >"$evidence_dir/fail-closed-original-verify.log" 2>&1
       original_verify_status=$?
     fi
+    install_disabled_config >"$evidence_dir/fail-closed-install-disabled-config.log" 2>&1
+    config_status=$?
     docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}|{{json .Mounts}}' \
       multica-backend-1 >"$evidence_dir/multica-backend-1.fail-closed" 2>&1
-    printf 'compose_status=%s\ndisabled_status=%s\nfallback_status=%s\noriginal_verify_status=%s\n' \
-      "$safe_status" "$disabled_status" "$fallback_status" "$original_verify_status" \
+    printf 'compose_status=%s\ndisabled_status=%s\nfallback_status=%s\noriginal_verify_status=%s\nconfig_status=%s\n' \
+      "$safe_status" "$disabled_status" "$fallback_status" "$original_verify_status" "$config_status" \
       >"$evidence_dir/fail-closed-status.txt"
     chmod 0600 "$evidence_dir"/*
     (cd "$evidence_dir" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS) || true

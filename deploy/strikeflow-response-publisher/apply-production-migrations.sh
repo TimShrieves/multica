@@ -91,7 +91,8 @@ if backend.get("image") != sys.argv[1] or backend.get("entrypoint") != ["./migra
 migrator_name=sf-response-migrate-gate-a-$evidence_name
 record_failure() {
   status=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   docker stop -t 10 "$migrator_name" >"$evidence_dir/failure-migrator-stop.log" 2>&1 || true
   docker rm -f "$migrator_name" >"$evidence_dir/failure-migrator-remove.log" 2>&1 || true
   printf 'migration_status=%s\n' "$status" >"$evidence_dir/status.txt"

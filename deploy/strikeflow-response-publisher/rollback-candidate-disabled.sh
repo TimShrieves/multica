@@ -74,7 +74,8 @@ restore_disabled_candidate() {
 }
 record_failure() {
   status=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ "$rollback_complete" != true ]; then
     printf 'rollback_status=%s\n' "$status" >"$evidence_dir/failure-status.txt"
     set +e

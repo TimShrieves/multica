@@ -61,6 +61,23 @@ restore_original_backend() {
   assert_original_backend
 }
 
+restore_disabled_candidate() {
+  STRIKEFLOW_RESPONSE_BACKEND_IMAGE=$image_digest \
+  docker compose --project-directory /opt/multica \
+    --env-file "$base_env" --env-file "$disabled_env" \
+    -f "$base_compose" -f "$pin_compose" -f "$disabled_overlay" \
+    up -d --no-deps --force-recreate backend || return 1
+  wait_for_ready || return 1
+  "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
+    --preserve-outbox "$release_dir" "$image_digest" "$starting_preflight"
+}
+
+install_disabled_config() {
+  disabled_tmp=$(mktemp /etc/multica-response-publisher/publisher.env.disabled.XXXXXX)
+  install -o root -g root -m 0600 "$disabled_env" "$disabled_tmp"
+  mv "$disabled_tmp" "$config_file"
+}
+
 evidence_parent=$(readlink -f "$(dirname "$evidence_dir")")
 evidence_name=$(basename "$evidence_dir")
 test "$evidence_parent" = /var/backups/multica-response-publisher
@@ -113,12 +130,21 @@ sed 's/^STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=.*/STRIKEFLOW_RESPONSE_PUBLISHER_E
 rollback_complete=false
 rollback_failure() {
   status=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ "$rollback_complete" != true ]; then
     set +e
-    restore_original_backend >"$evidence_dir/failure-restore-original.log" 2>&1
-    restore_status=$?
-    printf 'restore_original_status=%s\n' "$restore_status" >"$evidence_dir/failure-status.txt"
+    restore_disabled_candidate >"$evidence_dir/failure-restore-disabled.log" 2>&1
+    disabled_status=$?
+    restore_status=not_attempted
+    if [ "$disabled_status" -ne 0 ]; then
+      restore_original_backend >"$evidence_dir/failure-restore-original.log" 2>&1
+      restore_status=$?
+    fi
+    install_disabled_config >"$evidence_dir/failure-install-disabled-config.log" 2>&1
+    config_status=$?
+    printf 'restore_disabled_status=%s\nrestore_original_status=%s\nconfig_status=%s\n' \
+      "$disabled_status" "$restore_status" "$config_status" >"$evidence_dir/failure-status.txt"
     if [ -e "$safe_off" ]; then
       mv "$safe_off" "$evidence_dir/publisher.env.safe-off"
     fi
@@ -138,7 +164,7 @@ docker compose --project-directory /opt/multica \
   -f "$base_compose" -f "$pin_compose" -f "$disabled_overlay" \
   up -d --no-deps --force-recreate backend
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  --allow-delivered-outbox "$release_dir" "$image_digest" "$starting_preflight"
+  --preserve-outbox "$release_dir" "$image_digest" "$starting_preflight"
 docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' \
   multica-backend-1 >"$evidence_dir/multica-backend-1.safe-off"
 
@@ -146,8 +172,7 @@ docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings
 # two-file Compose project. Migrations/outbox/audit evidence are retained.
 restore_original_backend
 
-install -o root -g root -m 0600 \
-  "$release_dir/deploy/strikeflow-response-publisher/publisher.env.disabled" "$config_file"
+install_disabled_config
 docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' \
   multica-backend-1 >"$evidence_dir/multica-backend-1.restored"
 date -u +%FT%TZ >"$evidence_dir/rolled-back-at.txt"

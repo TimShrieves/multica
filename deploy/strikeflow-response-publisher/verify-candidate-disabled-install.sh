@@ -6,9 +6,10 @@ outbox_policy=empty
 case "${1:-}" in
   --before-start) mode=before-start; shift ;;
   --allow-delivered-outbox) outbox_policy=delivered; shift ;;
+  --preserve-outbox) outbox_policy=preserve; shift ;;
 esac
 if [ "$#" -ne 3 ]; then
-  echo "usage: $0 [--before-start|--allow-delivered-outbox] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
+  echo "usage: $0 [--before-start|--allow-delivered-outbox|--preserve-outbox] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
   exit 64
 fi
 
@@ -56,7 +57,7 @@ if [ "$outbox_policy" = empty ]; then
   outbox_count=$(docker exec -i multica-postgres-1 sh -c \
     'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox"')
   test "$outbox_count" = 0
-else
+elif [ "$outbox_policy" = delivered ]; then
   unsafe_outbox_count=$(docker exec -i multica-postgres-1 sh -c \
     'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox WHERE delivered_at IS NULL OR needs_attention_at IS NOT NULL"')
   test "$unsafe_outbox_count" = 0

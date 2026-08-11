@@ -98,7 +98,8 @@ backend_changed=false
 deployment_verified=false
 fail_closed() {
   status=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ "$backend_changed" = true ] && [ "$deployment_verified" != true ]; then
     set +e
     restore_original_backend >"$evidence_dir/failure-restore-original.log" 2>&1

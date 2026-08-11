@@ -189,6 +189,59 @@ image and `/readyz`, and only then restores the
 tracked blank disabled environment. Disable the StrikeFlow receiver after the
 publisher is proven false. Do not remove the HMAC file or database evidence.
 
+For a successful bounded canary that must retain the command-binding candidate
+for the next rollout gate, use the dedicated safe-off command instead of the
+full original-image rollback:
+
+```text
+safe-off-activated-to-candidate.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
+  STARTING_PREFLIGHT \
+  /var/backups/multica-response-publisher/safe-off-activated-<UTC>-<source> \
+  --confirm-safe-off-to-candidate
+```
+
+This path accepts only an enabled `explicit_commands` configuration containing
+exactly one command UUID and refuses to proceed while any outbox row is pending
+or needs attention. It snapshots the enabled configuration and database
+fingerprint, recreates only the sealed candidate with the publisher false,
+uses direct `./server` with no HMAC mount, and requires the receipt/outbox
+fingerprint to remain byte-identical across the recreate. Only after the live
+runtime is proven safe does it atomically restore the tracked blank environment.
+It preserves the HMAC credential, delivered outbox rows, migrations, receipts,
+and checksummed audit evidence. A failed safe-off retries the disabled candidate
+and falls back to the exact original backend only when the candidate cannot be
+proven safe; it never re-enables the publisher.
+
+If the canary itself fails and queued or `needs_attention` outbox rows must be
+preserved, use the same command with
+`--confirm-emergency-safe-off-to-candidate`. That mode relaxes only the outbox
+drain assertion: image, direct entrypoint, false environment, absent HMAC mount,
+health, catalog, scope precondition, container identity, and byte-identical
+database fingerprint checks remain mandatory. It records the emergency mode in
+the checksummed evidence and never retries delivery or edits evidence rows.
+
+## Exact replay canary
+
+Replay only the delivered `agent_comment.created` event with the sealed helper;
+never reconstruct JSON by hand or reset an outbox row:
+
+```text
+replay-delivered-comment.sh RELEASE IMAGE_DIGEST STARTING_PREFLIGHT \
+  COMMAND_ID EVENT_ID PAYLOAD_SHA256 RECORDED_AT \
+  /var/backups/multica-response-publisher/replay-comment-<UTC>-<source> \
+  --confirm-replay
+```
+
+The helper loads the exact delivered row, requires the one-command canary
+authorization, attempt count one, no attention state, and the immutable
+StrikeFlow payload hash. It serializes through the publisher's own payload
+type, signs fresh raw bytes inside the already-enabled container, and requires
+an HTTP 200 acknowledgement with `replay=true`, the same event ID, `responding`
+state, and the same `recorded_at`. The HMAC secret and signature never enter the
+command line or evidence. Multica receipt and full outbox fingerprints must be
+byte-identical before and after the replay, and the wrapper seals success or
+failure evidence.
+
 Dormant rollback removes or repoints only the candidate `current` symlink,
 release/config directory, and unused local image after verifying that the
 active Multica containers still match the preflight. It never runs Compose,

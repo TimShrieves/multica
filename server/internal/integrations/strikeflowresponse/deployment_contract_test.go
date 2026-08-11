@@ -88,6 +88,8 @@ func TestActivationScriptCannotBecomeTheMigrationApprovalGate(t *testing.T) {
 		"publisher.env.safe-off",
 		"activation_verified=false",
 		"fail-closed-fallback.log",
+		"fail-closed-install-disabled-config.log",
+		"install_disabled_config",
 		"SHA256SUMS",
 		"fallback_status=not_attempted",
 		"assert_original_backend",
@@ -109,6 +111,72 @@ func TestActivationScriptCannotBecomeTheMigrationApprovalGate(t *testing.T) {
 	overlay := strings.Index(text[base+pin:], `-f "$overlay"`)
 	if overlay < 0 {
 		t.Fatal("activation script does not preserve base, pin, overlay ordering")
+	}
+}
+
+func TestCandidateVerifierCanPreserveFailedOutboxWithoutWeakeningRuntimeChecks(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	verifier, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "verify-candidate-disabled-install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(verifier)
+	for _, required := range []string{
+		"--preserve-outbox",
+		"outbox_policy=preserve",
+		`if [ "$outbox_policy" = empty ]`,
+		`elif [ "$outbox_policy" = delivered ]`,
+		"disabled candidate must bypass the migration entrypoint",
+		"disabled candidate must not mount the response HMAC secret",
+		"rendered candidate publisher is not exactly false",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("preservation verifier is missing contract %q", required)
+		}
+	}
+}
+
+func TestReplayUtilityUsesSealedBinaryAndNeverMutatesOutbox(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "replay-delivered-comment.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, forbidden := range []string{"migrate", "UPDATE ", "DELETE ", "TRUNCATE ", "DROP "} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("replay wrapper contains forbidden operation %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"verify-enabled-install.sh",
+		"--rollback-preflight",
+		"./strikeflow-response-replay",
+		"--command-id",
+		"--event-id",
+		"--payload-sha256",
+		"--recorded-at",
+		"database.before",
+		"database.after",
+		`cmp -s "$evidence_dir/database.before" "$evidence_dir/database.after"`,
+		"replay-result.json",
+		"SHA256SUMS",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("replay wrapper is missing contract %q", required)
+		}
+	}
+	dockerfile, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"-o bin/strikeflow-response-replay ./cmd/strikeflow-response-replay",
+		"COPY --from=builder /src/server/bin/strikeflow-response-replay .",
+	} {
+		if !strings.Contains(string(dockerfile), required) {
+			t.Fatalf("candidate image omits replay binary contract %q", required)
+		}
 	}
 }
 
@@ -140,16 +208,73 @@ func TestRollbackVerifiesActivatedIdentityBeforeMutation(t *testing.T) {
 		"assert_activation_overlay",
 		`backend.get("entrypoint") != ["./server"]`,
 		"disabled_overlay",
-		"--allow-delivered-outbox",
+		"--preserve-outbox",
 		"restored_image_ref",
 		"assert_original_backend",
 		"restore_original_backend",
 		"failure-restore-original.log",
+		"failure-restore-disabled.log",
+		"failure-install-disabled-config.log",
+		"install_disabled_config",
 		"SHA256SUMS",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("rollback is missing original-backend safety contract %q", required)
 		}
+	}
+}
+
+func TestSuccessfulCanarySafeOffStopsAtDisabledCandidate(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "safe-off-activated-to-candidate.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, forbidden := range []string{"migrate up", "migrate down", "DELETE FROM", "TRUNCATE ", "DROP TABLE"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("candidate safe-off contains forbidden operation %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"verify-enabled-install.sh",
+		"--rollback-preflight",
+		"explicit_commands",
+		"len(commands) != 1",
+		"WHERE delivered_at IS NULL OR needs_attention_at IS NOT NULL",
+		"database.before",
+		"database.after",
+		`cmp -s "$evidence_dir/database.before" "$evidence_dir/database.after"`,
+		"verify-candidate-disabled-install.sh",
+		"--allow-delivered-outbox",
+		"--preserve-outbox",
+		"--confirm-emergency-safe-off-to-candidate",
+		"safe-off-mode.txt",
+		`--env-file "$base_env" --env-file "$disabled_env"`,
+		`-f "$base_compose" -f "$pin_compose" -f "$disabled_overlay"`,
+		"install_disabled_config",
+		"failure-restore-disabled.log",
+		"failure-restore-original.log",
+		"database.failure-final",
+		"SHA256SUMS",
+		"trap '' HUP INT TERM",
+		"safe_off_verified=true",
+		"multica_response_publisher_safe_off_candidate",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("candidate safe-off is missing contract %q", required)
+		}
+	}
+	if strings.Count(text, "restore_original_backend") < 2 {
+		t.Fatal("candidate safe-off must retain original backend as failure-only fallback")
+	}
+	successStart := strings.Index(text, `backend_changed=true`)
+	successEnd := strings.Index(text, `safe_off_verified=true`)
+	if successStart < 0 || successEnd < successStart {
+		t.Fatal("candidate safe-off success path is not identifiable")
+	}
+	if strings.Contains(text[successStart:successEnd], "restore_original_backend") {
+		t.Fatal("successful candidate safe-off must not restore the original backend")
 	}
 }
 
