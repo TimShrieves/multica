@@ -889,6 +889,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// user PAT and can never enter the generic protected route tree below.
 	r.Route("/api/integrations/strikeflow", func(r chi.Router) {
 		r.Use(middleware.StrikeFlowConnectorAuth(pool))
+		r.Post("/content-replies", h.ReplyStrikeFlowContentPackage)
 		r.Get("/inbox", h.ListStrikeFlowInbox)
 		r.Route("/inbox/{itemId}", func(r chi.Router) {
 			r.Get("/issue", h.GetStrikeFlowInboxIssue)

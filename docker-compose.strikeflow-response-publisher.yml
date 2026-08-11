@@ -1,0 +1,31 @@
+# Local-only overlay for the dormant StrikeFlow response publisher.
+#
+# Do not add this overlay to the active Compose project until a separately
+# approved activation window. With the default false flag the publisher does
+# not read the secret file, scan PostgreSQL, create outbox rows, or send HTTP.
+services:
+  backend:
+    # Activation must provide the immutable digest recorded in ARTIFACTS. The
+    # required expansion prevents this overlay from silently starting the old
+    # pinned backend image.
+    image: ${STRIKEFLOW_RESPONSE_BACKEND_IMAGE:?set the sealed candidate image digest}
+    # Migrations are an independently approved production gate. Candidate
+    # activation and safe-off recreates must bypass the image entrypoint.
+    entrypoint: ["./server"]
+    environment:
+      STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED: ${STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED:-false}
+      STRIKEFLOW_RESPONSE_WEBHOOK_URL: ${STRIKEFLOW_RESPONSE_WEBHOOK_URL:-}
+      STRIKEFLOW_RESPONSE_HMAC_SECRET_FILE: /run/secrets/strikeflow_response_hmac
+      STRIKEFLOW_RESPONSE_HMAC_KEY_ID: ${STRIKEFLOW_RESPONSE_HMAC_KEY_ID:-}
+      STRIKEFLOW_RESPONSE_WORKSPACE_ID: ${STRIKEFLOW_RESPONSE_WORKSPACE_ID:-}
+      STRIKEFLOW_RESPONSE_WORKSPACE_KEY: ${STRIKEFLOW_RESPONSE_WORKSPACE_KEY:-}
+      STRIKEFLOW_RESPONSE_PROJECT_IDS: ${STRIKEFLOW_RESPONSE_PROJECT_IDS:-}
+      STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE: ${STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE:-}
+      STRIKEFLOW_RESPONSE_COMMAND_IDS: ${STRIKEFLOW_RESPONSE_COMMAND_IDS:-}
+      STRIKEFLOW_RESPONSE_RECIPIENT_ID: ${STRIKEFLOW_RESPONSE_RECIPIENT_ID:-}
+      STRIKEFLOW_RESPONSE_AGENT_ID: ${STRIKEFLOW_RESPONSE_AGENT_ID:-}
+      STRIKEFLOW_RESPONSE_STR94_ISSUE_ID: ${STRIKEFLOW_RESPONSE_STR94_ISSUE_ID:-}
+      STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS: ${STRIKEFLOW_RESPONSE_EXCLUDED_ISSUE_IDS:-}
+      STRIKEFLOW_RESPONSE_NOT_BEFORE: ${STRIKEFLOW_RESPONSE_NOT_BEFORE:-}
+    volumes:
+      - ${STRIKEFLOW_RESPONSE_HMAC_HOST_FILE:?set the dedicated HMAC secret file}:/run/secrets/strikeflow_response_hmac:ro
