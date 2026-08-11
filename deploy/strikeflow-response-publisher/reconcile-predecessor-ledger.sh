@@ -143,15 +143,61 @@ BEGIN
     RAISE EXCEPTION 'required response tables are absent';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='strikeflow_connector_reply_receipt' AND column_name='strikeflow_command_id' AND data_type='uuid')
-     OR NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='public.strikeflow_connector_reply_receipt'::regclass AND tgname='strikeflow_reply_command_binding_immutable') THEN
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='public.strikeflow_connector_reply_receipt'::regclass AND tgname='strikeflow_reply_command_binding_immutable' AND tgfoid='public.reject_strikeflow_reply_command_binding_change()'::regprocedure AND tgtype=19 AND tgenabled='O' AND NOT tgisinternal)
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='public.strikeflow_response_outbox'::regclass AND tgname='strikeflow_response_outbox_identity_immutable' AND tgfoid='public.reject_strikeflow_response_outbox_identity_change()'::regprocedure AND tgtype=19 AND tgenabled='O' AND NOT tgisinternal)
+     OR (SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('public.strikeflow_connector_reply_receipt'::regclass,'public.strikeflow_response_outbox'::regclass) AND NOT tgisinternal) <> 2 THEN
     RAISE EXCEPTION 'predecessor reply-receipt command binding is not exact';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid='public.idx_strikeflow_connector_reply_command_unique'::regclass AND indisunique AND indisvalid AND indisready AND indislive) THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
+    WHERE p.oid='public.reject_strikeflow_reply_command_binding_change()'::regprocedure
+      AND l.lanname='plpgsql' AND p.prorettype='trigger'::regtype
+      AND p.prosrc LIKE '%NEW.strikeflow_command_id IS DISTINCT FROM OLD.strikeflow_command_id%'
+      AND p.prosrc LIKE '%strikeflow command binding is immutable%'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
+    WHERE p.oid='public.reject_strikeflow_response_outbox_identity_change()'::regprocedure
+      AND l.lanname='plpgsql' AND p.prorettype='trigger'::regtype
+      AND p.prosrc LIKE '%NEW.event_id%OLD.event_id%'
+      AND p.prosrc LIKE '%NEW.occurred_at%OLD.occurred_at%'
+      AND p.prosrc LIKE '%strikeflow response outbox identity is immutable%'
+  ) THEN
+    RAISE EXCEPTION 'predecessor immutable trigger function body is not exact';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid='public.idx_strikeflow_connector_reply_command_unique'::regclass
+      AND indrelid='public.strikeflow_connector_reply_receipt'::regclass
+      AND indisunique AND indisvalid AND indisready AND indislive AND indnkeyatts=1
+      AND pg_get_indexdef(indexrelid,1,true)='strikeflow_command_id'
+      AND regexp_replace(pg_get_expr(indpred,indrelid),'[[:space:]()]','','g')='strikeflow_command_idISNOTNULL'
+  ) THEN
     RAISE EXCEPTION 'predecessor command uniqueness index is absent';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid='public.idx_strikeflow_response_outbox_event_unique'::regclass AND indisunique AND indisvalid AND indisready AND indislive)
-     OR NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid='public.idx_strikeflow_response_outbox_due'::regclass AND indisvalid AND indisready AND indislive)
-     OR NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid='public.idx_strikeflow_response_outbox_event_id_unique'::regclass AND indisunique AND indisvalid AND indislive) THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid='public.idx_strikeflow_response_outbox_event_unique'::regclass
+      AND indrelid='public.strikeflow_response_outbox'::regclass
+      AND indisunique AND indisvalid AND indisready AND indislive AND indnkeyatts=3
+      AND pg_get_indexdef(indexrelid,1,true)='event_type'
+      AND pg_get_indexdef(indexrelid,2,true)='continuation_task_id'
+      AND regexp_replace(pg_get_indexdef(indexrelid,3,true),'[[:space:]()]','','g')='COALESCEagent_comment_id,''00000000-0000-0000-0000-000000000000''::uuid'
+      AND indpred IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid='public.idx_strikeflow_response_outbox_due'::regclass
+      AND indrelid='public.strikeflow_response_outbox'::regclass
+      AND NOT indisunique AND indisvalid AND indisready AND indislive AND indnkeyatts=2
+      AND pg_get_indexdef(indexrelid,1,true)='next_attempt_at'
+      AND pg_get_indexdef(indexrelid,2,true)='created_at'
+      AND regexp_replace(pg_get_expr(indpred,indrelid),'[[:space:]()]','','g')='delivered_atISNULL'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid='public.idx_strikeflow_response_outbox_event_id_unique'::regclass
+      AND indrelid='public.strikeflow_response_outbox'::regclass
+      AND indisunique AND indisvalid AND indisready AND indislive AND indnkeyatts=1
+      AND pg_get_indexdef(indexrelid,1,true)='event_id' AND indpred IS NULL
+  ) THEN
     RAISE EXCEPTION 'predecessor outbox indexes are not exact';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='strikeflow_connector_token' AND column_name='agent_id' AND data_type='uuid')
