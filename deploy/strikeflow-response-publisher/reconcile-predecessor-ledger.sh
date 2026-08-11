@@ -94,7 +94,11 @@ if response and (response.pop("STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED", None) != 
     raise SystemExit("publisher must remain disabled during ledger reconciliation")
 '
 docker inspect multica-backend-1 --format '{{json .Mounts}}' |
-  python3 -c 'import json,sys; raise SystemExit("HMAC mount present") if any(m.get("Destination")=="/run/secrets/strikeflow_response_hmac" for m in json.load(sys.stdin)) else None'
+  python3 -c '
+import json, sys
+if any(m.get("Destination") == "/run/secrets/strikeflow_response_hmac" for m in json.load(sys.stdin)):
+    raise SystemExit("HMAC mount present")
+'
 docker exec -i multica-postgres-1 sh -c 'psql -X -A -t -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version || '\''|'\'' || applied_at FROM schema_migrations ORDER BY version"' \
   >"$evidence_dir/migration-ledger.before"
 
