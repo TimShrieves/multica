@@ -64,7 +64,16 @@ for unit in \
   strikeflow-multica-content-dispatch.service strikeflow-multica-content-dispatch.timer \
   strikeflow-multica-content-ongoing.service strikeflow-multica-content-ongoing.timer; do
   systemctl is-active --quiet "$unit" 2>/dev/null && { echo "$unit is active" >&2; exit 1; } || true
-  systemctl is-enabled --quiet "$unit" 2>/dev/null && { echo "$unit is enabled" >&2; exit 1; } || true
+  enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  # `systemctl is-enabled --quiet` also succeeds for static units. Static
+  # response services are intentionally dormant and must not be rejected;
+  # reject only states that create an enablement path at boot/runtime.
+  case "$enabled_state" in
+    enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)
+      echo "$unit is enabled ($enabled_state)" >&2
+      exit 1
+      ;;
+  esac
   systemctl show "$unit" --property=MainPID --value 2>/dev/null || true
 done >"$evidence_dir/units.before"
 for container in multica-backend-1 multica-frontend-1 multica-postgres-1; do
