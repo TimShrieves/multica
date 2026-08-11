@@ -42,7 +42,10 @@ test "$(stat -c '%U:%G %a' "$backup_sha")" = root:root\ 600
 test "$(wc -l <"$backup_sha" | tr -d ' ')" -eq 1
 expected_backup_hash=$(awk 'NF == 2 {print $1}' "$backup_sha")
 expected_backup_name=$(awk 'NF == 2 {print $2}' "$backup_sha" | sed 's/^\*//')
-test "$expected_backup_name" = "$(basename "$backup_file")"
+# `sha256sum /absolute/path` records an absolute filename, while operators may
+# provide a sidecar written from the backup directory (basename only). Accept
+# exactly either spelling of the already-resolved approved backup path.
+test "$expected_backup_name" = "$backup_file" || test "$expected_backup_name" = "$(basename "$backup_file")"
 test "$expected_backup_hash" = "$(sha256sum "$backup_file" | awk '{print $1}')"
 
 exec 9>"$lock_file"

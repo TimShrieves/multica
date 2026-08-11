@@ -132,7 +132,7 @@ func TestProductionMigrationWrapperUsesOneOffMigratorAndNeverStartsBackend(t *te
 		"--confirm-migrate", "flock -n", `entrypoint: ["./migrate"]`,
 		`test "$image_digest" = "$artifact_image_digest"`,
 		`docker image inspect "$image_digest"`,
-		`test "$expected_backup_name" = "$(basename "$backup_file")"`,
+		`test "$expected_backup_name" = "$backup_file" || test "$expected_backup_name" = "$(basename "$backup_file")"`,
 		"run --name", "--rm --no-deps -T -e", "MULTICA_MIGRATION_ALLOWLIST", "backend up", "verify-candidate-disabled-install.sh",
 		"outbox_identity|", "content_identity|", "outbox_state|",
 		"253_strikeflow_response_outbox", "257_strikeflow_response_outbox_event_id_unique",
