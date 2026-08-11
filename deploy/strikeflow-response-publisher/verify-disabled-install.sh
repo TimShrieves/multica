@@ -29,6 +29,7 @@ artifacts_file=$release_dir/ARTIFACTS
 
 test -d "$release_dir"
 test -f "$release_dir/SHA256SUMS"
+test "$(grep -c '  deploy/strikeflow-response-publisher/adoption-contract.sh$' "$release_dir/SHA256SUMS")" -eq 1
 test -f "$artifacts_file"
 test "$(stat -c '%U:%G' "$release_dir")" = root:root
 test -z "$(find "$release_dir" -xdev -type l -print -quit)"

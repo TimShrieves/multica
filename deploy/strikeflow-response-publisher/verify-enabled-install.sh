@@ -2,12 +2,23 @@
 set -eu
 
 mode=running
+adoption_manifest=
 case "${1:-}" in
   --before-start) mode=before-start; shift ;;
   --rollback-preflight) mode=rollback-preflight; shift ;;
+  --adoption-before-start)
+    mode=adoption-before-start
+    adoption_manifest=${2:-}
+    shift 2
+    ;;
+  --adoption-after-start)
+    mode=adoption-after-start
+    adoption_manifest=${2:-}
+    shift 2
+    ;;
 esac
 if [ "$#" -ne 3 ]; then
-  echo "usage: $0 [--before-start] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
+  echo "usage: $0 [--before-start|--rollback-preflight|--adoption-before-start MANIFEST|--adoption-after-start MANIFEST] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
   exit 64
 fi
 
@@ -19,6 +30,7 @@ base_compose=/opt/multica/docker-compose.selfhost.yml
 pin_compose=/opt/multica/docker-compose.pin.yml
 overlay=$release_dir/docker-compose.strikeflow-response-publisher.yml
 base_env=/opt/multica/.env
+adoption_contract=$release_dir/deploy/strikeflow-response-publisher/adoption-contract.sh
 
 case "$release_dir" in /opt/multica-response-publisher/releases/*) ;; *) exit 1;; esac
 case "$preflight_dir" in /var/backups/multica-response-publisher/*) ;; *) exit 1;; esac
@@ -26,7 +38,7 @@ test "$(readlink -f /opt/multica-response-publisher/current)" = "$release_dir"
 test "$(stat -c '%U:%G %a' "$config_file")" = "root:root 600"
 test "$(stat -c '%U:%G %a' "$(dirname "$config_file")")" = "root:root 700"
 test "$(stat -c '%U:%G %a' "$preflight_dir")" = "root:root 700"
-test -f "$overlay" -a -f "$base_compose" -a -f "$pin_compose" -a -f "$base_env"
+test -f "$overlay" -a -f "$base_compose" -a -f "$pin_compose" -a -f "$base_env" -a -f "$adoption_contract"
 test -z "$(find "$release_dir" -xdev -type l -print -quit)"
 (cd "$release_dir" && sha256sum -c SHA256SUMS >/dev/null)
 (cd / && sha256sum -c "$preflight_dir/active-compose.sha256" >/dev/null)
@@ -89,7 +101,7 @@ except ValueError as exc:
     raise SystemExit("not-before is not RFC3339") from exc
 if parsed.tzinfo is None or parsed.utcoffset() is None:
     raise SystemExit("not-before must contain a timezone")
-if verify_mode == "before-start":
+if verify_mode in {"before-start", "adoption-before-start"}:
     age = datetime.datetime.now(datetime.timezone.utc) - parsed.astimezone(datetime.timezone.utc)
     if age < datetime.timedelta(0) or age > datetime.timedelta(hours=24):
         raise SystemExit("not-before must be within the previous 24 hours at activation")
@@ -149,7 +161,7 @@ if len(matches) != 1 or matches[0].get("source") != secret or matches[0].get("re
     raise SystemExit("rendered HMAC mount is not exact and read-only")
 ' "$image_digest" "$secret_file"
 
-if [ "$mode" = before-start ]; then
+if [ "$mode" = before-start ] || [ "$mode" = adoption-before-start ]; then
   expected=$(cat "$preflight_dir/multica-backend-1.identity")
   current=$(docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' multica-backend-1)
   test "$current" = "$expected"
@@ -292,5 +304,23 @@ if [ "$mode" != rollback-preflight ]; then
     'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox WHERE needs_attention_at IS NOT NULL"')
   test "$attention_count" = 0
 fi
+
+case "$mode" in
+  adoption-before-start|adoption-after-start)
+    # shellcheck source=/dev/null
+    . "$adoption_contract"
+    validate_adoption_manifest "$adoption_manifest"
+    verify_adoption_config
+    verify_response_reconciliation_stopped
+    verify_adoption_source_catalog
+    test "$(sed -n 's/^STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE=//p' "$config_file")" = receipt_lineage
+    test -z "$(sed -n 's/^STRIKEFLOW_RESPONSE_COMMAND_IDS=//p' "$config_file")"
+    if [ "$mode" = adoption-before-start ]; then
+      verify_adoption_outbox initial
+    else
+      verify_adoption_outbox delivered
+    fi
+    ;;
+esac
 
 echo "enabled_multica_response_publisher_ok mode=$mode image=$image_digest release=$(basename "$release_dir")"

@@ -1,8 +1,15 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 6 ] || [ "$6" != "--confirm-activate" ]; then
-  echo "usage: $0 RELEASE_DIR IMAGE_DIGEST ORIGINAL_PREFLIGHT STARTING_PREFLIGHT EVIDENCE_DIR --confirm-activate" >&2
+activation_mode=standard
+adoption_manifest=
+if [ "$#" -eq 6 ] && [ "$6" = "--confirm-activate" ]; then
+  :
+elif [ "$#" -eq 7 ] && [ "$7" = "--confirm-activate-adopt-reconciled" ]; then
+  activation_mode=adoption
+  adoption_manifest=$6
+else
+  echo "usage: $0 RELEASE_DIR IMAGE_DIGEST ORIGINAL_PREFLIGHT STARTING_PREFLIGHT EVIDENCE_DIR [ADOPTION_MANIFEST] (--confirm-activate|--confirm-activate-adopt-reconciled)" >&2
   exit 64
 fi
 release_dir=$(readlink -f "$1")
@@ -18,6 +25,7 @@ disabled_overlay=$release_dir/docker-compose.strikeflow-response-candidate-disab
 disabled_env=$release_dir/deploy/strikeflow-response-publisher/publisher.env.disabled
 base_env=/opt/multica/.env
 lock_file=/run/lock/multica-response-publisher-deploy.lock
+adoption_contract=$release_dir/deploy/strikeflow-response-publisher/adoption-contract.sh
 
 exec 9>"$lock_file"
 flock -n 9 || { echo "another response deployment is running" >&2; exit 1; }
@@ -83,10 +91,45 @@ test "$original_preflight" != "$starting_preflight"
 test "$(stat -c '%U:%G %a' "$original_preflight")" = "root:root 700"
 test "$(stat -c '%U:%G %a' "$starting_preflight")" = "root:root 700"
 test -z "$(find "$original_preflight" "$starting_preflight" -xdev -type l -print -quit)"
-"$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  --allow-delivered-outbox "$release_dir" "$image_digest" "$starting_preflight"
-"$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
-  --before-start "$release_dir" "$image_digest" "$starting_preflight"
+producer_freeze_held=false
+producer_freeze_dir=
+producer_freeze_log=
+cleanup_early_freeze() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ "${producer_freeze_held:-false}" = true ]; then
+    release_receipt_producer_freeze >/dev/null 2>&1 || true
+    rm -rf "$producer_freeze_dir"
+  elif [ -n "${producer_freeze_dir:-}" ]; then
+    abort_receipt_producer_freeze >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_early_freeze EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$activation_mode" = adoption ]; then
+  # shellcheck source=/dev/null
+  . "$adoption_contract"
+  validate_adoption_manifest "$adoption_manifest"
+  verify_adoption_config
+  verify_response_reconciliation_stopped
+  acquire_receipt_producer_freeze
+  producer_freeze_held=true
+  verify_adoption_source_catalog
+  "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
+    --allow-reconciled-pending-outbox "$adoption_manifest" \
+    "$release_dir" "$image_digest" "$starting_preflight"
+  "$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
+    --adoption-before-start "$adoption_manifest" \
+    "$release_dir" "$image_digest" "$starting_preflight"
+else
+  "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
+    --allow-delivered-outbox "$release_dir" "$image_digest" "$starting_preflight"
+  "$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
+    --before-start "$release_dir" "$image_digest" "$starting_preflight"
+fi
 expected_image=$(cut -d'|' -f2 "$original_preflight/multica-backend-1.identity")
 expected_ports=$(cut -d'|' -f4 "$original_preflight/multica-backend-1.identity")
 starting_image=$(cut -d'|' -f2 "$starting_preflight/multica-backend-1.identity")
@@ -109,6 +152,13 @@ printf '%s\n' "$original_preflight" >"$evidence_dir/original-preflight.txt"
 printf '%s\n' "$starting_preflight" >"$evidence_dir/starting-preflight.txt"
 install -o root -g root -m 0600 "$config_file" "$evidence_dir/publisher.env.enabled"
 sha256sum "$evidence_dir/publisher.env.enabled" >"$evidence_dir/publisher.env.enabled.sha256"
+printf '%s\n' "$activation_mode" >"$evidence_dir/activation-mode.txt"
+if [ "$activation_mode" = adoption ]; then
+  install -o root -g root -m 0600 "$adoption_manifest" "$evidence_dir/adoption-manifest.env"
+  sha256sum "$evidence_dir/adoption-manifest.env" >"$evidence_dir/adoption-manifest.env.sha256"
+  verify_adoption_source_catalog >"$evidence_dir/adoption-source-catalog.before"
+  adoption_identity_fingerprint >"$evidence_dir/adoption-identity.before"
+fi
 safe_off=$evidence_dir/publisher.env.safe-off
 sed 's/^STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=.*/STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=false/' \
   "$config_file" >"$safe_off"
@@ -126,6 +176,11 @@ fail_closed() {
   trap '' HUP INT TERM
   if [ "$backend_changed" = true ] && [ "$activation_verified" != true ]; then
     set +e
+    reconciliation_stop_status=not_applicable
+    if [ "$activation_mode" = adoption ]; then
+      stop_response_reconciliation_fail_closed >"$evidence_dir/fail-closed-stop-reconciliation.log" 2>&1
+      reconciliation_stop_status=$?
+    fi
     # First return to the sealed disabled candidate without the HMAC mount.
     # Only fall back to the original base+pin image if that safe state cannot
     # be proven.
@@ -136,8 +191,10 @@ fail_closed() {
       up -d --no-deps --force-recreate backend \
       >"$evidence_dir/fail-closed-compose.log" 2>&1
     safe_status=$?
+    fail_closed_outbox_mode=--allow-delivered-outbox
+    if [ "$activation_mode" = adoption ]; then fail_closed_outbox_mode=--preserve-outbox; fi
     "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-      --allow-delivered-outbox "$release_dir" "$image_digest" "$starting_preflight" \
+      "$fail_closed_outbox_mode" "$release_dir" "$image_digest" "$starting_preflight" \
       >"$evidence_dir/fail-closed-disabled-verify.log" 2>&1
     disabled_status=$?
     fallback_status=not_attempted
@@ -150,14 +207,29 @@ fail_closed() {
     fi
     install_disabled_config >"$evidence_dir/fail-closed-install-disabled-config.log" 2>&1
     config_status=$?
+    producer_freeze_release_status=not_applicable
+    if [ "$producer_freeze_held" = true ]; then
+      release_receipt_producer_freeze
+      producer_freeze_release_status=$?
+      producer_freeze_held=false
+      install -o root -g root -m 0600 "$producer_freeze_log" "$evidence_dir/producer-freeze.log" 2>/dev/null || true
+      rm -rf "$producer_freeze_dir"
+    fi
     docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}|{{json .Mounts}}' \
       multica-backend-1 >"$evidence_dir/multica-backend-1.fail-closed" 2>&1
-    printf 'compose_status=%s\ndisabled_status=%s\nfallback_status=%s\noriginal_verify_status=%s\nconfig_status=%s\n' \
-      "$safe_status" "$disabled_status" "$fallback_status" "$original_verify_status" "$config_status" \
+    printf 'reconciliation_stop_status=%s\nproducer_freeze_release_status=%s\ncompose_status=%s\ndisabled_status=%s\nfallback_status=%s\noriginal_verify_status=%s\nconfig_status=%s\n' \
+      "$reconciliation_stop_status" "$producer_freeze_release_status" "$safe_status" "$disabled_status" "$fallback_status" "$original_verify_status" "$config_status" \
       >"$evidence_dir/fail-closed-status.txt"
     chmod 0600 "$evidence_dir"/*
     (cd "$evidence_dir" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS) || true
     chmod 0600 "$evidence_dir"/SHA256SUMS 2>/dev/null || true
+  fi
+  if [ "$producer_freeze_held" = true ]; then
+    set +e
+    release_receipt_producer_freeze
+    producer_freeze_held=false
+    install -o root -g root -m 0600 "$producer_freeze_log" "$evidence_dir/producer-freeze.log" 2>/dev/null || true
+    rm -rf "$producer_freeze_dir"
   fi
   exit "$status"
 }
@@ -176,8 +248,33 @@ docker compose --project-directory /opt/multica \
   up -d --no-deps --force-recreate backend
 
 wait_for_ready
-"$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
-  "$release_dir" "$image_digest" "$starting_preflight"
+if [ "$activation_mode" = adoption ]; then
+  # Only the running publisher may change the two rows, and only through its
+  # normal authenticated 200 acknowledgment path. No deployment script issues
+  # UPDATE/DELETE against response evidence.
+  adoption_attempt=0
+  while [ "$adoption_attempt" -lt 30 ]; do
+    if verify_adoption_outbox delivered >/dev/null 2>&1; then break; fi
+    adoption_attempt=$((adoption_attempt + 1))
+    sleep 2
+  done
+  test "$adoption_attempt" -lt 30
+  "$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
+    --adoption-after-start "$adoption_manifest" \
+    "$release_dir" "$image_digest" "$starting_preflight"
+  adoption_identity_fingerprint >"$evidence_dir/adoption-identity.after"
+  cmp -s "$evidence_dir/adoption-identity.before" "$evidence_dir/adoption-identity.after"
+  verify_adoption_source_catalog >"$evidence_dir/adoption-source-catalog.after"
+  cmp -s "$evidence_dir/adoption-source-catalog.before" "$evidence_dir/adoption-source-catalog.after"
+  verify_response_reconciliation_stopped
+  release_receipt_producer_freeze
+  producer_freeze_held=false
+  install -o root -g root -m 0600 "$producer_freeze_log" "$evidence_dir/producer-freeze.log"
+  rm -rf "$producer_freeze_dir"
+else
+  "$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh" \
+    "$release_dir" "$image_digest" "$starting_preflight"
+fi
 docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' \
   multica-backend-1 >"$evidence_dir/multica-backend-1.after"
 date -u +%FT%TZ >"$evidence_dir/activated-at.txt"

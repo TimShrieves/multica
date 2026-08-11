@@ -3,13 +3,19 @@ set -eu
 
 mode=running
 outbox_policy=empty
+adoption_manifest=
 case "${1:-}" in
   --before-start) mode=before-start; shift ;;
   --allow-delivered-outbox) outbox_policy=delivered; shift ;;
   --preserve-outbox) outbox_policy=preserve; shift ;;
+  --allow-reconciled-pending-outbox)
+    outbox_policy=adoption
+    adoption_manifest=${2:-}
+    shift 2
+    ;;
 esac
 if [ "$#" -ne 3 ]; then
-  echo "usage: $0 [--before-start|--allow-delivered-outbox|--preserve-outbox] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
+  echo "usage: $0 [--before-start|--allow-delivered-outbox|--preserve-outbox|--allow-reconciled-pending-outbox MANIFEST] RELEASE_DIR IMAGE_DIGEST PREFLIGHT_DIR" >&2
   exit 64
 fi
 
@@ -22,11 +28,12 @@ overlay=$release_dir/docker-compose.strikeflow-response-candidate-disabled.yml
 base_env=/opt/multica/.env
 disabled_env=$release_dir/deploy/strikeflow-response-publisher/publisher.env.disabled
 catalog_source=$release_dir/deploy/strikeflow-response-publisher/verify-enabled-install.sh
+adoption_contract=$release_dir/deploy/strikeflow-response-publisher/adoption-contract.sh
 
 case "$release_dir" in /opt/multica-response-publisher/releases/*) ;; *) exit 1;; esac
 case "$preflight_dir" in /var/backups/multica-response-publisher/*) ;; *) exit 1;; esac
 test "$(readlink -f /opt/multica-response-publisher/current)" = "$release_dir"
-test -f "$overlay" -a -f "$base_compose" -a -f "$pin_compose" -a -f "$base_env" -a -f "$disabled_env"
+test -f "$overlay" -a -f "$base_compose" -a -f "$pin_compose" -a -f "$base_env" -a -f "$disabled_env" -a -f "$adoption_contract"
 test -f "$catalog_source"
 test "$(stat -c '%U:%G' "$release_dir")" = root:root
 test -z "$(find "$release_dir" -xdev \( ! -user root -o ! -group root \) -print -quit)"
@@ -61,6 +68,17 @@ elif [ "$outbox_policy" = delivered ]; then
   unsafe_outbox_count=$(docker exec -i multica-postgres-1 sh -c \
     'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox WHERE delivered_at IS NULL OR needs_attention_at IS NOT NULL"')
   test "$unsafe_outbox_count" = 0
+elif [ "$outbox_policy" = adoption ]; then
+  # The manifest is operator-created evidence that the exact natural responses
+  # already converged through StrikeFlow's cross-mode reconciliation fix. This
+  # verifier only permits that exact ordered pair and never edits either ledger.
+  # shellcheck source=/dev/null
+  . "$adoption_contract"
+  validate_adoption_manifest "$adoption_manifest"
+  verify_adoption_config
+  verify_response_reconciliation_stopped
+  verify_adoption_source_catalog
+  verify_adoption_outbox initial
 fi
 
 # Render only the non-secret image override and an exact false publisher flag.

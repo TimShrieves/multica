@@ -140,6 +140,99 @@ activate.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT STARTING_PREFLIGHT \
   --confirm-activate
 ```
 
+### Reconciled-pending adoption
+
+The normal activation gate refuses every pending or attention outbox row. After
+StrikeFlow's cross-ingest idempotency fix is live, an operator may instead adopt
+one exact, already-reconciled response pair with the explicit adoption mode.
+The root-owned mode-0600 manifest must live below
+`/var/backups/multica-response-publisher/` and contain exactly:
+
+```text
+ADOPTION_CONTRACT_VERSION=2
+ADOPTION_EVENT_IDS=<agent-comment-event-uuid>,<task-completed-event-uuid>
+ADOPTION_COMMAND_ID=<command-uuid>
+ADOPTION_WORKSPACE_KEY=<exact-workspace-key>
+ADOPTION_WORKSPACE_ID=<workspace-uuid>
+ADOPTION_PROJECT_ID=<project-uuid>
+ADOPTION_ISSUE_ID=<issue-uuid>
+ADOPTION_ISSUE_IDENTIFIER=<issue-identifier>
+ADOPTION_INBOX_ITEM_ID=<inbox-item-uuid>
+ADOPTION_ROOT_COMMENT_ID=<root-comment-uuid>
+ADOPTION_MEMBER_COMMENT_ID=<member-reply-uuid>
+ADOPTION_CONTINUATION_TASK_ID=<task-uuid>
+ADOPTION_RECIPIENT_ID=<recipient-uuid>
+ADOPTION_AGENT_ID=<agent-uuid>
+ADOPTION_AGENT_COMMENT_ID=<agent-comment-uuid>
+ADOPTION_AGENT_COMMENT_PARENT_ID=<parent-agent-comment-uuid-or-null>
+ADOPTION_COMMENT_CONTENT_SHA256=<lowercase-sha256>
+ADOPTION_COMMENT_TYPE=<comment-type>
+ADOPTION_COMMENT_OCCURRED_AT=<RFC3339-with-timezone>
+ADOPTION_COMPLETION_OCCURRED_AT=<RFC3339-with-timezone>
+ADOPTION_NOT_BEFORE=<exact-configured-RFC3339-floor>
+ADOPTION_INITIAL_STATE=<pending_pair-or-comment_delivered_completion_pending>
+ADOPTION_COMMENT_ATTEMPT_COUNT=<0-11>
+ADOPTION_COMPLETION_ATTEMPT_COUNT=<0-11>
+ADOPTION_COMMENT_NEXT_ATTEMPT_AT=<RFC3339-with-timezone>
+ADOPTION_COMPLETION_NEXT_ATTEMPT_AT=<RFC3339-with-timezone>
+ADOPTION_COMMENT_LEASE_UNTIL=null
+ADOPTION_COMPLETION_LEASE_UNTIL=<expired-RFC3339-or-null>
+ADOPTION_COMMENT_DELIVERED_AT=<RFC3339-with-timezone-or-null>
+ADOPTION_COMPLETION_DELIVERED_AT=null
+ADOPTION_COMMENT_NEEDS_ATTENTION_AT=null
+ADOPTION_COMPLETION_NEEDS_ATTENTION_AT=null
+ADOPTION_COMMENT_LAST_ERROR=null
+ADOPTION_COMPLETION_LAST_ERROR=<SHA256-of-transient-error-or-null>
+ADOPTION_RECEIPT_TOKEN_ID=<token-uuid>
+ADOPTION_RECEIPT_IDEMPOTENCY_KEY=<idempotency-uuid>
+ADOPTION_RECEIPT_PAYLOAD_HASH=<lowercase-sha256>
+ADOPTION_RECEIPT_CREATED_AT=<RFC3339-with-timezone>
+ADOPTION_RECEIPT_COMMITTED_AT=<RFC3339-with-timezone>
+ADOPTION_RECONCILED_AT=<RFC3339-with-timezone>
+ADOPTION_STRIKEFLOW_DEPLOYMENT_ID=<live-deployment-id>
+ADOPTION_STRIKEFLOW_SOURCE_COMMIT=<40-character-lowercase-commit>
+```
+
+The reconciliation evidence must be from the previous 24 hours. The verifier
+requires the configured immutable `NOT_BEFORE` recovery floor to be newer than
+the adopted receipt and response pair and every existing receipt in the exact
+scope. The publisher-equivalent source query must expose zero historical rows,
+so `RecoverOnce` cannot insert a third row during startup. Response
+reconciliation timer/service must remain disabled, inactive and at `MainPID=0`
+through the adoption transition. The manifest binds the full workspace, project,
+issue, inbox, root, member, recipient, agent, task, comment, content, receipt,
+attempt, lease, delivery and error state. It accepts either two pending rows or
+the resumable ordered state where the comment is delivered and completion is
+pending. That completion may retain an exactly fingerprinted transient error
+and expired lease, but it must already be due; active leases, attention state,
+completion-first, or dirty delivered comments fail closed. It
+does not mark, delete, reset, or otherwise edit either ledger.
+
+Activation holds the global `multica.strikeflow.response.producer.freeze`
+PostgreSQL advisory lock from the first source-catalog proof through publisher
+recovery, delivery and the post-start catalog proof. The sealed connector reply
+handler takes the matching transaction lock before reserving a receipt. Both
+ongoing-content and response-reconciliation service/timer pairs must be
+inactive, their timers disabled, and every `MainPID` zero. External direct SQL
+receipt writers do not honor the application lock; they are unsupported and
+must be independently frozen before this gate.
+
+```text
+activate.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT STARTING_PREFLIGHT \
+  /var/backups/multica-response-publisher/activation-adoption-<UTC>-<source> \
+  /var/backups/multica-response-publisher/adoption-<UTC>.env \
+  --confirm-activate-adopt-reconciled
+```
+
+The sealed release checksum closure must include `adoption-contract.sh` exactly
+once. Activation requires `receipt_lineage` with an empty command list. The publisher
+must receive normal authenticated `200` acknowledgments for both events within
+60 seconds. The post-start verifier requires both rows delivered, zero unsafe
+outbox rows, and a byte-stable receipt/outbox identity fingerprint that excludes
+only normal delivery-state fields. Failure recreates the disabled candidate
+without its HMAC mount and preserves the pending/attention evidence. Never use
+this mode before the recorded StrikeFlow cross-mode fix is live.
+
 The verifier checks the sealed release and image, secret metadata, exact scope
 and authorization mode, rendered Compose semantics, production catalog, active
 container identities, restart policy, mount, config-file ordering, and absence
@@ -200,9 +293,13 @@ safe-off-activated-to-candidate.sh RELEASE IMAGE_DIGEST ORIGINAL_PREFLIGHT \
   --confirm-safe-off-to-candidate
 ```
 
-This path accepts only an enabled `explicit_commands` configuration containing
-exactly one command UUID and refuses to proceed while any outbox row is pending
-or needs attention. It snapshots the enabled configuration and database
+This path accepts either an enabled `explicit_commands` configuration containing
+exactly one command UUID or `receipt_lineage` with an empty command list. Before
+publisher safe-off it disables and stops
+`strikeflow-multica-content-dispatch.timer` and stops its service, proving both
+inactive and the timer disabled; it never restarts continuous scheduling. Normal
+mode refuses to proceed while any outbox row is pending or needs attention. It
+snapshots the enabled configuration, response-reconciliation unit state, and database
 fingerprint, recreates only the sealed candidate with the publisher false,
 uses direct `./server` with no HMAC mount, and requires the receipt/outbox
 fingerprint to remain byte-identical across the recreate. Only after the live

@@ -827,6 +827,15 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to start connector replay")
 		return
 	}
+	// Receipt reservation is one of the producer paths fenced by the
+	// receipt-lineage adoption gate.  Taking the transaction-scoped lock before
+	// replay lookup also waits for an in-flight reservation to finish before an
+	// operator snapshots the source catalog.
+	if err := util.LockResponseProducer(r.Context(), replayTx); err != nil {
+		_ = replayTx.Rollback(r.Context())
+		writeError(w, http.StatusInternalServerError, "failed to lock connector reply")
+		return
+	}
 	var replayItem strikeFlowBoundItem
 	var replayHash string
 	var replayCommentID, replayCommandID pgtype.UUID
@@ -893,6 +902,10 @@ func (h *Handler) ReplyStrikeFlowInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err := util.LockResponseProducer(r.Context(), tx); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to lock connector reply")
+		return
+	}
 	lockedItem, err := loadStrikeFlowBoundItemFrom(r.Context(), tx, scope, item.ItemID, true)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "inbox item not found")

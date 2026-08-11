@@ -1382,16 +1382,42 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	comment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
-		IssueID:      issue.ID,
-		WorkspaceID:  issue.WorkspaceID,
-		AuthorType:   authorType,
-		AuthorID:     parseUUID(authorID),
-		Content:      req.Content,
-		Type:         req.Type,
-		ParentID:     parentID,
-		SourceTaskID: sourceTaskID,
-	})
+	var comment db.Comment
+	var err error
+	if authorType == "agent" && h.TxStarter != nil {
+		tx, txErr := h.TxStarter.Begin(r.Context())
+		if txErr == nil {
+			defer tx.Rollback(r.Context())
+			txErr = util.LockResponseProducer(r.Context(), tx)
+			if txErr == nil {
+				comment, txErr = h.Queries.WithTx(tx).CreateComment(r.Context(), db.CreateCommentParams{
+					IssueID:      issue.ID,
+					WorkspaceID:  issue.WorkspaceID,
+					AuthorType:   authorType,
+					AuthorID:     parseUUID(authorID),
+					Content:      req.Content,
+					Type:         req.Type,
+					ParentID:     parentID,
+					SourceTaskID: sourceTaskID,
+				})
+			}
+			if txErr == nil {
+				txErr = tx.Commit(r.Context())
+			}
+		}
+		err = txErr
+	} else {
+		comment, err = h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
+			IssueID:      issue.ID,
+			WorkspaceID:  issue.WorkspaceID,
+			AuthorType:   authorType,
+			AuthorID:     parseUUID(authorID),
+			Content:      req.Content,
+			Type:         req.Type,
+			ParentID:     parentID,
+			SourceTaskID: sourceTaskID,
+		})
+	}
 	if err != nil {
 		slog.Warn("create comment failed", append(logger.RequestAttrs(r), "error", err, "issue_id", issueID)...)
 		writeError(w, http.StatusInternalServerError, "failed to create comment: "+err.Error())

@@ -23,6 +23,10 @@ disabled_overlay=$release_dir/docker-compose.strikeflow-response-candidate-disab
 disabled_env=$release_dir/deploy/strikeflow-response-publisher/publisher.env.disabled
 base_env=/opt/multica/.env
 lock_file=/run/lock/multica-response-publisher-deploy.lock
+reconciliation_timer=strikeflow-multica-content-dispatch.timer
+reconciliation_service=strikeflow-multica-content-dispatch.service
+ongoing_timer=strikeflow-multica-content-ongoing.timer
+ongoing_service=strikeflow-multica-content-ongoing.service
 
 exec 9>"$lock_file"
 flock -n 9 || { echo "another response deployment is running" >&2; exit 1; }
@@ -79,6 +83,39 @@ install_disabled_config() {
   mv "$disabled_tmp" "$config_file"
 }
 
+capture_reconciliation_state() {
+  output=$1
+  systemctl show "$reconciliation_timer" "$reconciliation_service" "$ongoing_timer" "$ongoing_service" \
+    --property=Id,LoadState,ActiveState,SubState,UnitFileState,Result,MainPID >"$output"
+}
+
+stop_response_reconciliation() {
+  # New response receipts or fallback reconciliation must not race publisher
+  # safe-off. This operation is intentionally one-way; rollback never restarts
+  # continuous scheduling without a separate activation approval.
+  stop_attempt=0
+  while [ "$stop_attempt" -lt 3 ]; do
+    systemctl disable --now "$reconciliation_timer" "$ongoing_timer" >/dev/null 2>&1 || true
+    systemctl stop "$reconciliation_service" "$ongoing_service" >/dev/null 2>&1 || true
+    timer_pid=$(systemctl show "$reconciliation_timer" --property=MainPID --value 2>/dev/null || echo unknown)
+    service_pid=$(systemctl show "$reconciliation_service" --property=MainPID --value 2>/dev/null || echo unknown)
+    ongoing_timer_pid=$(systemctl show "$ongoing_timer" --property=MainPID --value 2>/dev/null || echo unknown)
+    ongoing_service_pid=$(systemctl show "$ongoing_service" --property=MainPID --value 2>/dev/null || echo unknown)
+    if ! systemctl is-active --quiet "$reconciliation_timer" \
+       && ! systemctl is-active --quiet "$reconciliation_service" \
+       && ! systemctl is-active --quiet "$ongoing_timer" \
+       && ! systemctl is-active --quiet "$ongoing_service" \
+       && ! systemctl is-enabled --quiet "$reconciliation_timer" \
+       && ! systemctl is-enabled --quiet "$ongoing_timer" \
+       && [ "$timer_pid" = 0 ] && [ "$service_pid" = 0 ] \
+       && [ "$ongoing_timer_pid" = 0 ] && [ "$ongoing_service_pid" = 0 ]; then
+      return 0
+    fi
+    stop_attempt=$((stop_attempt + 1))
+  done
+  return 1
+}
+
 evidence_parent=$(readlink -f "$(dirname "$evidence_dir")")
 evidence_name=$(basename "$evidence_dir")
 test "$evidence_parent" = /var/backups/multica-response-publisher
@@ -102,12 +139,17 @@ test "$(sed -n 's/^image_digest=//p' "$release_dir/ARTIFACTS")" = "$image_digest
 python3 - "$config_file" <<'PY'
 import pathlib, uuid, sys
 values = dict(line.split("=", 1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines())
-if values.get("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE") != "explicit_commands":
-    raise SystemExit("safe-off requires explicit_commands canary mode")
+mode = values.get("STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE")
 commands = [value.strip() for value in values.get("STRIKEFLOW_RESPONSE_COMMAND_IDS", "").split(",") if value.strip()]
-if len(commands) != 1:
-    raise SystemExit("safe-off requires exactly one canary command")
-uuid.UUID(commands[0])
+if mode == "explicit_commands":
+    if len(commands) != 1:
+        raise SystemExit("explicit_commands safe-off requires exactly one canary command")
+    uuid.UUID(commands[0])
+elif mode == "receipt_lineage":
+    if commands:
+        raise SystemExit("receipt_lineage safe-off requires an empty command list")
+else:
+    raise SystemExit("safe-off authorization mode is invalid")
 PY
 unsafe_outbox_count=$(docker exec -i multica-postgres-1 sh -c \
   'psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM strikeflow_response_outbox WHERE delivered_at IS NULL OR needs_attention_at IS NOT NULL"')
@@ -137,6 +179,8 @@ printf '%s\n' "$original_preflight" >"$evidence_dir/original-preflight.txt"
 printf '%s\n' "$starting_preflight" >"$evidence_dir/starting-preflight.txt"
 printf '%s\n' "$safe_off_mode" >"$evidence_dir/safe-off-mode.txt"
 install -o root -g root -m 0600 "$config_file" "$evidence_dir/publisher.env.enabled"
+sed -n 's/^STRIKEFLOW_RESPONSE_AUTHORIZATION_MODE=//p' "$config_file" >"$evidence_dir/authorization-mode.txt"
+capture_reconciliation_state "$evidence_dir/response-reconciliation.before"
 database_fingerprint >"$evidence_dir/database.before"
 for container in multica-backend-1 multica-frontend-1 multica-postgres-1; do
   docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}|{{json .Config.Entrypoint}}' \
@@ -144,13 +188,16 @@ for container in multica-backend-1 multica-frontend-1 multica-postgres-1; do
 done
 
 backend_changed=false
+safe_off_started=false
 safe_off_verified=false
 record_failure() {
   status=$?
   trap - EXIT
   trap '' HUP INT TERM
-  if [ "$backend_changed" = true ] && [ "$safe_off_verified" != true ]; then
+  if { [ "$backend_changed" = true ] || [ "$safe_off_started" = true ]; } && [ "$safe_off_verified" != true ]; then
     set +e
+    stop_response_reconciliation >"$evidence_dir/failure-stop-reconciliation.log" 2>&1
+    reconciliation_stop_status=$?
     disabled_verify_mode=--preserve-outbox
     restore_disabled_candidate >"$evidence_dir/failure-restore-disabled.log" 2>&1
     disabled_status=$?
@@ -161,21 +208,26 @@ record_failure() {
     fi
     install_disabled_config >"$evidence_dir/failure-install-disabled-config.log" 2>&1
     config_status=$?
-    printf 'safe_off_status=%s\nrestore_disabled_status=%s\nrestore_original_status=%s\nconfig_status=%s\n' \
-      "$status" "$disabled_status" "$original_status" "$config_status" >"$evidence_dir/failure-status.txt"
+    printf 'safe_off_status=%s\nreconciliation_stop_status=%s\nrestore_disabled_status=%s\nrestore_original_status=%s\nconfig_status=%s\n' \
+      "$status" "$reconciliation_stop_status" "$disabled_status" "$original_status" "$config_status" >"$evidence_dir/failure-status.txt"
     database_fingerprint >"$evidence_dir/database.failure-final" 2>&1 || true
     docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}|{{json .Mounts}}' \
       multica-backend-1 >"$evidence_dir/multica-backend-1.failure-final" 2>&1 || true
-    chmod 0600 "$evidence_dir"/* 2>/dev/null || true
-    (cd "$evidence_dir" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS) || true
-    chmod 0600 "$evidence_dir"/SHA256SUMS 2>/dev/null || true
   fi
+  capture_reconciliation_state "$evidence_dir/response-reconciliation.failure-final" 2>/dev/null || true
+  chmod 0600 "$evidence_dir"/* 2>/dev/null || true
+  (cd "$evidence_dir" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS) || true
+  chmod 0600 "$evidence_dir"/SHA256SUMS 2>/dev/null || true
   exit "$status"
 }
 trap record_failure EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+safe_off_started=true
+stop_response_reconciliation
+capture_reconciliation_state "$evidence_dir/response-reconciliation.after-stop"
 
 backend_changed=true
 restore_disabled_candidate >"$evidence_dir/safe-off-compose-and-verify.log" 2>&1
@@ -194,6 +246,7 @@ install_disabled_config
 test "$(sed -n 's/^STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=//p' "$config_file")" = false
 test -z "$(sed -n '/^STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED=/!s/^[^=]*=\(.*\)$/\1/p' "$config_file" | sed '/^$/d')"
 date -u +%FT%TZ >"$evidence_dir/safe-off-at.txt"
+capture_reconciliation_state "$evidence_dir/response-reconciliation.final"
 (cd "$evidence_dir" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS)
 chmod 0600 "$evidence_dir"/*
 safe_off_verified=true
