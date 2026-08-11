@@ -153,4 +153,7 @@ func TestProductionMigrationWrapperUsesOneOffMigratorAndNeverStartsBackend(t *te
 			t.Fatalf("production migration wrapper contains forbidden operation %q", forbidden)
 		}
 	}
+	if strings.Contains(text, `-v aliases="$(printf '%s' "$canonical_aliases"`) {
+		t.Fatal("mainline before-ledger normalization must retain already-reconciled canonical aliases")
+	}
 }
