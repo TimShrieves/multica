@@ -61,21 +61,24 @@ func TestDisabledCandidateVerifierReusesExactCatalogAndRequiresEmptyOutbox(t *te
 	}
 }
 
-func TestDisabledCandidateDeployVerifiesBeforeRecreateAndRestoresOriginal(t *testing.T) {
+func TestDisabledCandidateDeployVerifiesOriginalBeforeRecreateAndRestoresOriginal(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	raw, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "deploy-candidate-disabled.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	verify := strings.Index(text, "--before-start")
+	verify := strings.Index(text, "--migration-preflight --allow-delivered-outbox")
 	change := strings.Index(text, "backend_changed=true")
 	recreate := -1
 	if change >= 0 {
 		recreate = strings.Index(text[change:], "up -d --no-deps --force-recreate backend")
 	}
 	if verify < 0 || change < 0 || recreate < 0 || verify > change {
-		t.Fatal("disabled candidate must be verified before backend recreation")
+		t.Fatal("disabled candidate deploy must verify the original runtime before backend recreation")
+	}
+	if strings.Contains(text[:change], "--before-start --allow-delivered-outbox") {
+		t.Fatal("pre-recreate candidate deploy must not use the post-recreate before-start mode")
 	}
 	for _, required := range []string{
 		"flock -n", "restore_original_backend", "failure-restore-original.log",
