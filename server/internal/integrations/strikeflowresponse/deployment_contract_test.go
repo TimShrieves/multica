@@ -462,7 +462,7 @@ func TestAdoptionQuiescenceBehavior(t *testing.T) {
 	script := `#!/bin/sh
 case "$1" in
   is-active) test "${ACTIVE_UNIT:-}" = "$3" ;;
-  is-enabled) test "${ENABLED_UNIT:-}" = "$3" ;;
+  is-enabled) if test "${ENABLED_UNIT:-}" = "${3:-$2}"; then echo enabled; else echo static; fi ;;
   show) if test "${PID_UNIT:-}" = "$2"; then echo 42; else echo 0; fi ;;
   *) exit 2 ;;
 esac
@@ -689,6 +689,56 @@ func TestSuccessfulCanarySafeOffStopsAtDisabledCandidate(t *testing.T) {
 	recreatePublisher := strings.Index(text[successStart:successEnd], "restore_disabled_candidate") + successStart
 	if stopScheduler < 0 || recreatePublisher < successStart || stopScheduler > recreatePublisher {
 		t.Fatal("response reconciliation must stop before publisher safe-off")
+	}
+}
+
+func TestCandidateSafeOffClassifiesStaticTimerUnits(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "safe-off-activated-to-candidate.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"systemd_unit_is_enabled()",
+		"enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)",
+		"disabled|static|indirect|masked)",
+		"&& ! systemd_unit_is_enabled \"$reconciliation_timer\"",
+		"&& ! systemd_unit_is_enabled \"$ongoing_timer\"",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("candidate safe-off must classify static timer units explicitly; missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`systemctl is-enabled --quiet "$reconciliation_timer"`,
+		`systemctl is-enabled --quiet "$ongoing_timer"`,
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("candidate safe-off must not reject static units via %q", forbidden)
+		}
+	}
+}
+
+func TestAdoptionQuiescenceClassifiesStaticTimerUnits(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "adoption-contract.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"systemd_unit_is_enabled()",
+		"enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)",
+		"disabled|static|indirect|masked)",
+		"if systemd_unit_is_enabled \"$unit\"; then return 1; fi",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("adoption quiescence must classify static timer units explicitly; missing %q", required)
+		}
+	}
+	if strings.Contains(text, `systemctl is-enabled --quiet "$unit"`) {
+		t.Fatal("adoption quiescence must not reject static units via is-enabled --quiet")
 	}
 }
 

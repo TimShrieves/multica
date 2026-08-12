@@ -245,11 +245,27 @@ END \$\$;
 SQL
 }
 
+systemd_unit_is_enabled() {
+  unit=$1
+  enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  case "$enabled_state" in
+    enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)
+      return 0
+      ;;
+    disabled|static|indirect|masked)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 verify_response_reconciliation_stopped() {
   for unit in strikeflow-multica-content-dispatch.timer strikeflow-multica-content-dispatch.service \
               strikeflow-multica-content-ongoing.timer strikeflow-multica-content-ongoing.service; do
     if systemctl is-active --quiet "$unit"; then return 1; fi
-    case "$unit" in *.timer) if systemctl is-enabled --quiet "$unit"; then return 1; fi ;; esac
+    case "$unit" in *.timer) if systemd_unit_is_enabled "$unit"; then return 1; fi ;; esac
     test "$(systemctl show "$unit" --property=MainPID --value)" = 0 || return 1
   done
 }
