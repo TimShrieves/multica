@@ -261,12 +261,21 @@ systemd_unit_is_enabled() {
   esac
 }
 
+systemd_unit_main_pid_is_zero() {
+  unit=$1
+  main_pid=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)
+  case "$main_pid" in
+    ""|0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 verify_response_reconciliation_stopped() {
   for unit in strikeflow-multica-content-dispatch.timer strikeflow-multica-content-dispatch.service \
               strikeflow-multica-content-ongoing.timer strikeflow-multica-content-ongoing.service; do
     if systemctl is-active --quiet "$unit"; then return 1; fi
     case "$unit" in *.timer) if systemd_unit_is_enabled "$unit"; then return 1; fi ;; esac
-    test "$(systemctl show "$unit" --property=MainPID --value)" = 0 || return 1
+    systemd_unit_main_pid_is_zero "$unit" || return 1
   done
 }
 

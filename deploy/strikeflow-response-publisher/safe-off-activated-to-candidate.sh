@@ -108,6 +108,15 @@ systemd_unit_is_enabled() {
   esac
 }
 
+systemd_unit_main_pid_is_zero() {
+  unit=$1
+  main_pid=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)
+  case "$main_pid" in
+    ""|0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 stop_response_reconciliation() {
   # New response receipts or fallback reconciliation must not race publisher
   # safe-off. This operation is intentionally one-way; rollback never restarts
@@ -116,18 +125,16 @@ stop_response_reconciliation() {
   while [ "$stop_attempt" -lt 3 ]; do
     systemctl disable --now "$reconciliation_timer" "$ongoing_timer" >/dev/null 2>&1 || true
     systemctl stop "$reconciliation_service" "$ongoing_service" >/dev/null 2>&1 || true
-    timer_pid=$(systemctl show "$reconciliation_timer" --property=MainPID --value 2>/dev/null || echo unknown)
-    service_pid=$(systemctl show "$reconciliation_service" --property=MainPID --value 2>/dev/null || echo unknown)
-    ongoing_timer_pid=$(systemctl show "$ongoing_timer" --property=MainPID --value 2>/dev/null || echo unknown)
-    ongoing_service_pid=$(systemctl show "$ongoing_service" --property=MainPID --value 2>/dev/null || echo unknown)
     if ! systemctl is-active --quiet "$reconciliation_timer" \
        && ! systemctl is-active --quiet "$reconciliation_service" \
        && ! systemctl is-active --quiet "$ongoing_timer" \
        && ! systemctl is-active --quiet "$ongoing_service" \
        && ! systemd_unit_is_enabled "$reconciliation_timer" \
        && ! systemd_unit_is_enabled "$ongoing_timer" \
-       && [ "$timer_pid" = 0 ] && [ "$service_pid" = 0 ] \
-       && [ "$ongoing_timer_pid" = 0 ] && [ "$ongoing_service_pid" = 0 ]; then
+       && systemd_unit_main_pid_is_zero "$reconciliation_timer" \
+       && systemd_unit_main_pid_is_zero "$reconciliation_service" \
+       && systemd_unit_main_pid_is_zero "$ongoing_timer" \
+       && systemd_unit_main_pid_is_zero "$ongoing_service"; then
       return 0
     fi
     stop_attempt=$((stop_attempt + 1))

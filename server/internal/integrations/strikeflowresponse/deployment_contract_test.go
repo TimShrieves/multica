@@ -648,7 +648,7 @@ func TestSuccessfulCanarySafeOffStopsAtDisabledCandidate(t *testing.T) {
 		"response-reconciliation.final",
 		"safe_off_started=true",
 		`while [ "$stop_attempt" -lt 3 ]`,
-		`[ "$timer_pid" = 0 ]`, `[ "$service_pid" = 0 ]`,
+		"systemd_unit_main_pid_is_zero",
 		"failure-stop-reconciliation.log", "reconciliation_stop_status",
 		"WHERE delivered_at IS NULL OR needs_attention_at IS NOT NULL",
 		"database.before",
@@ -701,6 +701,7 @@ func TestCandidateSafeOffClassifiesStaticTimerUnits(t *testing.T) {
 	text := string(script)
 	for _, required := range []string{
 		"systemd_unit_is_enabled()",
+		"systemd_unit_main_pid_is_zero()",
 		"enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)",
 		"disabled|static|indirect|masked)",
 		"&& ! systemd_unit_is_enabled \"$reconciliation_timer\"",
@@ -729,6 +730,7 @@ func TestAdoptionQuiescenceClassifiesStaticTimerUnits(t *testing.T) {
 	text := string(script)
 	for _, required := range []string{
 		"systemd_unit_is_enabled()",
+		"systemd_unit_main_pid_is_zero()",
 		"enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)",
 		"disabled|static|indirect|masked)",
 		"if systemd_unit_is_enabled \"$unit\"; then return 1; fi",
