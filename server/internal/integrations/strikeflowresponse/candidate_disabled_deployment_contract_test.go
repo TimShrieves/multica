@@ -61,6 +61,25 @@ func TestDisabledCandidateVerifierReusesExactCatalogAndRequiresEmptyOutbox(t *te
 	}
 }
 
+func TestDisabledInstallPreservesOnlyTheSealedHostHMACFile(t *testing.T) {
+	root := responsePublisherRepoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "verify-disabled-install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, required := range []string{
+		`publisher.env strikeflow-response-hmac `,
+		`stat -c '%U:%G %a %s' "$hmac_file"`,
+		`hmac-file.sha256`,
+		`test ! -L "$hmac_file"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("disabled install must preserve and verify %q", required)
+		}
+	}
+}
+
 func TestDisabledCandidateDeployVerifiesOriginalBeforeRecreateAndRestoresOriginal(t *testing.T) {
 	root := responsePublisherRepoRoot(t)
 	raw, err := os.ReadFile(filepath.Join(root, "deploy", "strikeflow-response-publisher", "deploy-candidate-disabled.sh"))

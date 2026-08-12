@@ -11,6 +11,7 @@ image_tag=$2
 preflight_dir=$3
 install_root=/opt/multica-response-publisher
 config_file=/etc/multica-response-publisher/publisher.env
+hmac_file=/etc/multica-response-publisher/strikeflow-response-hmac
 
 resolved_release_dir=$(readlink -f "$release_dir")
 resolved_preflight_dir=$(readlink -f "$preflight_dir")
@@ -76,7 +77,12 @@ if grep -Eq '^STRIKEFLOW_RESPONSE_(PUBLISHER_ENABLED=true|BACKEND_IMAGE=.+|WEBHO
   exit 1
 fi
 
-test "$(find /etc/multica-response-publisher -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = publisher.env
+test "$(find /etc/multica-response-publisher -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "publisher.env strikeflow-response-hmac "
+test ! -L "$hmac_file"
+test "$(stat -c '%U:%G %a %s' "$hmac_file")" = "root:root 600 64"
+if [ -f "$preflight_dir/hmac-file.sha256" ]; then
+  test "$(sha256sum "$hmac_file" | cut -d' ' -f1)" = "$(tr -d '\r\n' <"$preflight_dir/hmac-file.sha256")"
+fi
 
 for container in multica-backend-1 multica-frontend-1 multica-postgres-1; do
   current=$(docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' "$container")
