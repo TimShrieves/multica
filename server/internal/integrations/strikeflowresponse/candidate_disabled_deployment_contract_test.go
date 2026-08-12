@@ -51,6 +51,9 @@ func TestDisabledCandidateVerifierReusesExactCatalogAndRequiresEmptyOutbox(t *te
 		`delivered_at IS NULL OR needs_attention_at IS NOT NULL`,
 		`backend.get("entrypoint") != ["./server"]`,
 		`STRIKEFLOW_RESPONSE_PUBLISHER_ENABLED`,
+		`if [ "$mode" = migration-preflight ]; then`,
+		`if [ "$mode" = before-start ]; then`,
+		`test "$current" = "$(cat "$preflight_dir/multica-backend-1.identity")"`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("disabled candidate verifier missing %q", required)
