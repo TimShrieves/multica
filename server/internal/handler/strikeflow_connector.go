@@ -486,15 +486,27 @@ func (h *Handler) GetStrikeFlowInboxIssue(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) strikeFlowTaskEvidence(r *http.Request, issueID, rootCommentID, sourceTaskID pgtype.UUID) ([]map[string]any, bool, error) {
 	rows, err := h.DB.Query(r.Context(), `
+		WITH RECURSIVE response_thread_comments AS (
+			SELECT id
+			FROM comment
+			WHERE id=$2 AND issue_id=$1
+			UNION ALL
+			SELECT child.id
+			FROM comment child
+			JOIN response_thread_comments parent ON child.parent_id=parent.id
+			WHERE child.issue_id=$1
+		)
 		SELECT id,agent_id,status,trigger_comment_id,originator_user_id,
 		       accountable_user_id,originator_source,trigger_evidence_kind,
 		       trigger_evidence_ref_id,delivered_comment_ids,created_at,completed_at
 		FROM agent_task_queue
 		WHERE issue_id=$1 AND (
-		  ($2::uuid IS NOT NULL AND id=$2) OR trigger_comment_id=$3 OR $3=ANY(delivered_comment_ids)
+		  ($3::uuid IS NOT NULL AND id=$3)
+		  OR trigger_comment_id IN (SELECT id FROM response_thread_comments)
+		  OR $2=ANY(delivered_comment_ids)
 		)
 		ORDER BY created_at
-	`, issueID, sourceTaskID, rootCommentID)
+	`, issueID, rootCommentID, sourceTaskID)
 	if err != nil {
 		return nil, false, err
 	}
