@@ -149,7 +149,9 @@ func TestMainlineMigrationGateIsBoundedAndProducerFrozen(t *testing.T) {
 	verifierText := string(verifier)
 	for _, required := range []string{
 		"while [ \"$#\" -gt 0 ]", "--before-start", "--migration-preflight", "--allow-delivered-outbox",
-		`[ "$mode" = before-start ] || [ "$mode" = migration-preflight ]`,
+		`[ "$mode" = migration-preflight ]`,
+		`[ "$mode" = before-start ]`,
+		`test "$current" = "$(cat "$preflight_dir/multica-backend-1.identity")"`,
 		"outbox_policy=delivered",
 	} {
 		if !strings.Contains(verifierText, required) {

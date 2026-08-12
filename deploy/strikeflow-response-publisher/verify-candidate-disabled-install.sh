@@ -116,11 +116,15 @@ for container in multica-frontend-1 multica-postgres-1; do
   test "$current" = "$(cat "$preflight_dir/$container.identity")"
 done
 
-if [ "$mode" = before-start ] || [ "$mode" = migration-preflight ]; then
+if [ "$mode" = migration-preflight ]; then
   current=$(docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' multica-backend-1)
   test "$current" = "$(cat "$preflight_dir/multica-backend-1.identity")"
   test "$(docker inspect multica-backend-1 --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}')" = "$base_compose,$pin_compose"
 else
+  if [ "$mode" = before-start ]; then
+    current=$(docker inspect -f '{{.Id}}|{{.Image}}|{{.State.Running}}|{{json .NetworkSettings.Ports}}' multica-backend-1)
+    test "$current" = "$(cat "$preflight_dir/multica-backend-1.identity")"
+  fi
   test "$(docker inspect multica-backend-1 --format '{{.Image}}')" = "$image_id"
   test "$(docker inspect multica-backend-1 --format '{{.State.Running}}')" = true
   test "$(docker inspect multica-backend-1 --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped
