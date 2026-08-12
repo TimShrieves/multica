@@ -67,7 +67,7 @@ restore_disabled_candidate() {
 }
 
 "$release_dir/deploy/strikeflow-response-publisher/verify-candidate-disabled-install.sh" \
-  --before-start --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
+  --migration-preflight --allow-delivered-outbox "$release_dir" "$image_digest" "$preflight_dir"
 restored_image_ref=$(docker compose --project-directory /opt/multica --env-file "$base_env" \
   -f "$base_compose" -f "$pin_compose" config --format json |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["backend"]["image"])')
