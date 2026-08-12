@@ -89,6 +89,25 @@ capture_reconciliation_state() {
     --property=Id,LoadState,ActiveState,SubState,UnitFileState,Result,MainPID >"$output"
 }
 
+# systemctl is-enabled exits successfully for static units even though they
+# cannot be enabled. Treat only explicit enablement states as enabled; unknown
+# states fail closed so safe-off never reports quiescence prematurely.
+systemd_unit_is_enabled() {
+  unit=$1
+  enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  case "$enabled_state" in
+    enabled|enabled-runtime|linked|linked-runtime|alias|generated|transient)
+      return 0
+      ;;
+    disabled|static|indirect|masked)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 stop_response_reconciliation() {
   # New response receipts or fallback reconciliation must not race publisher
   # safe-off. This operation is intentionally one-way; rollback never restarts
@@ -105,8 +124,8 @@ stop_response_reconciliation() {
        && ! systemctl is-active --quiet "$reconciliation_service" \
        && ! systemctl is-active --quiet "$ongoing_timer" \
        && ! systemctl is-active --quiet "$ongoing_service" \
-       && ! systemctl is-enabled --quiet "$reconciliation_timer" \
-       && ! systemctl is-enabled --quiet "$ongoing_timer" \
+       && ! systemd_unit_is_enabled "$reconciliation_timer" \
+       && ! systemd_unit_is_enabled "$ongoing_timer" \
        && [ "$timer_pid" = 0 ] && [ "$service_pid" = 0 ] \
        && [ "$ongoing_timer_pid" = 0 ] && [ "$ongoing_service_pid" = 0 ]; then
       return 0
