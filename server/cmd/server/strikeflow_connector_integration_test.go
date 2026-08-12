@@ -458,6 +458,60 @@ func TestStrikeFlowConnectorReplyIdempotency(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestStrikeFlowInboxIssueIncludesContinuationTaskFromReplyThread(t *testing.T) {
+	f := seedStrikeFlowIntegrationFixture(t)
+	path := "/api/integrations/strikeflow/inbox/" + f.itemID + "/replies"
+	resp := strikeFlowRequest(t, f.valid, http.MethodPost, path, map[string]any{
+		"idempotency_key":       "00000000-0000-4000-8000-000000000094",
+		"strikeflow_command_id": "10000000-0000-4000-8000-000000000004",
+		"message":               "Create a continuation task for response reconciliation.",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("reply = %d", resp.StatusCode)
+	}
+	var reply struct {
+		CommentID string `json:"comment_id"`
+		TaskID    string `json:"task_id"`
+	}
+	readJSON(t, resp, &reply)
+	resp.Body.Close()
+	if reply.CommentID == "" || reply.TaskID == "" {
+		t.Fatalf("reply missing continuation binding: %+v", reply)
+	}
+
+	resp = strikeFlowRequest(t, f.valid, http.MethodGet,
+		"/api/integrations/strikeflow/inbox/"+f.itemID+"/issue", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("issue = %d", resp.StatusCode)
+	}
+	var issue struct {
+		Tasks []struct {
+			ID                string  `json:"id"`
+			TriggerCommentID  *string `json:"trigger_comment_id"`
+			OriginatorUserID  *string `json:"originator_user_id"`
+			AccountableUserID *string `json:"accountable_user_id"`
+		} `json:"tasks"`
+	}
+	readJSON(t, resp, &issue)
+	resp.Body.Close()
+	var found bool
+	for _, task := range issue.Tasks {
+		if task.ID == reply.TaskID {
+			found = true
+			if task.TriggerCommentID == nil || *task.TriggerCommentID != reply.CommentID {
+				t.Fatalf("continuation trigger binding = %v, want %s", task.TriggerCommentID, reply.CommentID)
+			}
+			if task.OriginatorUserID == nil || *task.OriginatorUserID != testUserID ||
+				task.AccountableUserID == nil || *task.AccountableUserID != testUserID {
+				t.Fatalf("continuation actor binding = originator %v accountable %v", task.OriginatorUserID, task.AccountableUserID)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("issue task evidence omitted continuation task %s: %+v", reply.TaskID, issue.Tasks)
+	}
+}
+
 func TestStrikeFlowConnectorLegacyReplyHashReplayAndPublisherExclusion(t *testing.T) {
 	f := seedStrikeFlowIntegrationFixture(t)
 	path := "/api/integrations/strikeflow/inbox/" + f.itemID + "/replies"
